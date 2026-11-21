@@ -11,8 +11,19 @@ use parquet::schema::parser::parse_message_type;
 
 use crate::{CampAgg, Ctx, UserRow, id};
 
+/// Dictionary encoding (with RLE indexes) for every column except the IDs,
+/// which are nearly all distinct, and no statistics: the files come out a
+/// fraction of the plain size, so there is less for the disk to absorb.
 fn props() -> Arc<WriterProperties> {
-    Arc::new(WriterProperties::builder().set_dictionary_enabled(false).build())
+    use parquet::file::properties::EnabledStatistics;
+    use parquet::schema::types::ColumnPath;
+    Arc::new(
+        WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build(),
+    )
 }
 
 struct Writer<'a> {

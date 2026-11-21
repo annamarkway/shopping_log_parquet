@@ -48,7 +48,7 @@ const fn env_or(v: Option<&str>, d: usize) -> usize {
     }
 }
 const P: usize = env_or(option_env!("SS_P"), 512);
-const Q: usize = env_or(option_env!("SS_Q"), 512);
+const Q: usize = env_or(option_env!("SS_Q"), 128);
 const CHUNK: usize = env_or(option_env!("SS_CHUNK_KB"), 2048) << 10;
 /// `ts` of an event that failed validation.
 const INVALID: u32 = u32::MAX;
@@ -178,6 +178,19 @@ fn main() {
         }
     }
 
+    if let Ok(gb) = std::env::var("ALLOC_GB").map(|v| v.parse::<usize>().unwrap()) {
+        // Teardown experiment: touch `gb` GB in 64 MB vectors, then exit
+        // either holding them (default) or after freeing them in parallel.
+        let v: Vec<Vec<u8>> = (0..gb * 16).into_par_iter().map(|_| vec![1u8; 64 << 20]).collect();
+        log!("allocated {} GB", gb);
+        if std::env::var_os("FREE_PAR").is_some() {
+            v.into_par_iter().for_each(drop);
+            log!("freed");
+        } else {
+            std::mem::forget(v);
+        }
+        return;
+    }
     let event_maps = map_dir(&data.join("events"));
     let click_maps = map_dir(&data.join("clicks"));
     log!("mapped");
@@ -256,6 +269,13 @@ fn main() {
         );
     output::write_all(&ctx, &out, &users, &camp);
     log!("done: {} user rows", users.iter().map(|u| u.len()).sum::<usize>());
+    if std::env::var_os("SS_DEBUG").is_some() {
+        if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            for l in t.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
+                eprintln!("{l}");
+            }
+        }
+    }
     // Skip freeing everything: the process is about to exit.
     std::mem::forget((recs, clicks, users, event_maps, click_maps, ctx));
 }
