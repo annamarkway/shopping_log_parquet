@@ -631,13 +631,18 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
                     h = (h + 1) & mask;
                 }
             }
+            // Mark the kept copies, then read the copies in order (the table
+            // order is random, so reading through it misses the cache).
+            let mut keep = vec![0u8; v.len()];
+            for &k in &table {
+                if k != u32::MAX {
+                    unsafe { *keep.get_unchecked_mut(k as usize) = 1 };
+                }
+            }
             let mut recs: Vec<Rec> = Vec::with_capacity(v.len());
-            for &t in &table {
-                if t != u32::MAX {
-                    let e = unsafe { v.get_unchecked(t as usize) };
-                    if e.ts != INVALID {
-                        recs.push(Rec { person: e.person, ts: e.ts, meta: e.meta });
-                    }
+            for (e, &k) in v.iter().zip(&keep) {
+                if k != 0 && e.ts != INVALID {
+                    recs.push(Rec { person: e.person, ts: e.ts, meta: e.meta });
                 }
             }
             links.resolve_all(&mut recs, |r| &mut r.person);
@@ -775,8 +780,13 @@ fn sessions_for_partition(
     let reach = CLICK_REACH as u32;
     let mut camp = vec![[0u64; 4]; ncamp * nd];
     let mut users = Vec::new();
-    let mut stamp = vec![0u32; ncamp];
-    let mut gen_ = 0u32;
+    // Clicks per campaign in the current 7-day window, and the campaigns with
+    // at least one (`active`, with each one's index in it in `at`).
+    let mut cnt = vec![0u32; ncamp];
+    let mut at = vec![0u32; ncamp];
+    let mut active: Vec<u16> = Vec::new();
+    // Assisted sessions as [day][campaign]: one session's increments share a row.
+    let mut asst = vec![0u32; nd * ncamp];
     let mut catrev = vec![0u64; ctx.cat_names.len()];
 
     for g in 0..ng {
@@ -848,9 +858,24 @@ fn sessions_for_partition(
 
             // Attribution and assists: clicks in [start - 7 days, start].
             while r < pc.len() && pc[r].ts <= start {
+                let c = pc[r].camp as usize;
+                if cnt[c] == 0 {
+                    at[c] = active.len() as u32;
+                    active.push(c as u16);
+                }
+                cnt[c] += 1;
                 r += 1;
             }
             while l < r && pc[l].ts < start - reach {
+                let c = pc[l].camp as usize;
+                cnt[c] -= 1;
+                if cnt[c] == 0 {
+                    let i = at[c] as usize;
+                    let last = *active.last().unwrap();
+                    active[i] = last;
+                    at[last as usize] = i as u32;
+                    active.pop();
+                }
                 l += 1;
             }
             let di = (sday - ctx.day_base) as usize;
@@ -859,16 +884,21 @@ fn sessions_for_partition(
             a[0] += 1;
             a[1] += bought as u64;
             a[2] += rev;
-            gen_ += 1;
-            for c in &pc[l..r] {
-                let c = c.camp as usize;
-                if stamp[c] != gen_ {
-                    stamp[c] = gen_;
-                    camp[c * nd + di][3] += 1;
-                }
+            let row = &mut asst[di * ncamp..(di + 1) * ncamp];
+            for &c in &active {
+                unsafe { *row.get_unchecked_mut(c as usize) += 1 };
             }
         }
         flush(day, d_sessions, d_events, d_revenue, &mut catrev, &mut users);
+        for &c in &active {
+            cnt[c as usize] = 0;
+        }
+        active.clear();
+    }
+    for di in 0..nd {
+        for c in 0..ncamp {
+            camp[c * nd + di][3] += asst[di * ncamp + c] as u64;
+        }
     }
     (users, camp)
 }
