@@ -32,9 +32,24 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const SESSION_GAP: u32 = 1_800_000;
 const CLICK_REACH: i64 = 7 * DAY;
 /// Partitions by event_id (dedup) and by person (sessions).
-const P: usize = 512;
-const Q: usize = 512;
-const CHUNK: usize = 2 << 20;
+const fn env_or(v: Option<&str>, d: usize) -> usize {
+    match v {
+        None => d,
+        Some(s) => {
+            let b = s.as_bytes();
+            let mut n = 0;
+            let mut i = 0;
+            while i < b.len() {
+                n = n * 10 + (b[i] - b'0') as usize;
+                i += 1;
+            }
+            n
+        }
+    }
+}
+const P: usize = env_or(option_env!("SS_P"), 512);
+const Q: usize = env_or(option_env!("SS_Q"), 512);
+const CHUNK: usize = env_or(option_env!("SS_CHUNK_KB"), 2048) << 10;
 /// `ts` of an event that failed validation.
 const INVALID: u32 = u32::MAX;
 
@@ -164,6 +179,10 @@ fn main() {
     }
 
     let event_maps = map_dir(&data.join("events"));
+    let click_maps = map_dir(&data.join("clicks"));
+    log!("mapped");
+    let ctx = load_ctx(&data);
+    log!("lookups");
     if let Ok(mode) = std::env::var("BENCH") {
         let cs = chunks(&event_maps);
         for _ in 0..3 {
@@ -172,6 +191,11 @@ fn main() {
                 "lines" => cs.par_iter().map(|c| { let mut n = 0; csv::for_each_line(c.bytes, c.first, |_| n += 1); n }).sum(),
                 "split" => cs.par_iter().map(|c| { let mut n = 0; csv::for_each_line(c.bytes, c.first, |l| if csv::split::<7>(l).is_some() { n += 1 }); n }).sum(),
                 "scan" => cs.par_iter().map(|c| { let mut n = 0; csv::scan::<7>(c.bytes, c.first, |_| n += 1); n }).sum(),
+                "parse" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan::<7>(c.bytes, c.first, |f| if let Some(e) = parse_event(&ctx, f) { n = n.wrapping_add(e.eid ^ e.person ^ e.ts as u64) }); n as usize }).sum(),
+                "keys" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan::<7>(c.bytes, c.first, |f| { n = n.wrapping_add(id::key(f[0]) ^ id::key(f[1])) }); n as usize }).sum(),
+                "tsonly" => cs.par_iter().map(|c| { let mut n = 0i64; csv::scan::<7>(c.bytes, c.first, |f| { n = n.wrapping_add(ts::parse(f[2]).unwrap_or(0) ^ ts::parse(f[3]).unwrap_or(0)) }); n as usize }).sum(),
+                "store" => cs.par_iter().map(|c| { let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64); csv::scan::<7>(c.bytes, c.first, |f| if let Some(e) = parse_event(&ctx, f) { v.push(e) }); v.len() }).sum(),
+                "full" => parse_events(&ctx, &event_maps).iter().map(|p| p.data.len()).sum(),
                 "ts" => cs.par_iter().map(|c| { let mut n = 0; csv::for_each_line(c.bytes, c.first, |l| if let Some(f) = csv::split::<7>(l) { if ts::parse(f[2]).is_some() { n += 1 } if ts::parse(f[3]).is_some() { n += 1 } }); n }).sum(),
                 _ => cs.par_iter().map(|c| c.bytes.iter().map(|&b| b as usize).sum::<usize>()).sum(),
             };
@@ -179,10 +203,6 @@ fn main() {
         }
         return;
     }
-    let click_maps = map_dir(&data.join("clicks"));
-    log!("mapped");
-    let ctx = load_ctx(&data);
-    log!("lookups");
 
     // Parsing needs no links, so the (mostly single-threaded) link work runs
     // alongside it; persons are resolved afterwards.
@@ -604,7 +624,8 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
             Parted::new(&recs, Q, |r| person_part(r.person))
         })
         .collect();
-    std::mem::forget(parsed);
+    // Free in parallel so later stages reuse these pages instead of fresh, zeroed ones.
+    parsed.into_par_iter().for_each(drop);
     out
 }
 

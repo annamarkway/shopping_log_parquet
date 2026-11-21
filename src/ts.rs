@@ -174,6 +174,15 @@ pub fn parse(s: &[u8]) -> Option<i64> {
     if let Some(v) = f1_fast(s) {
         return Some(v);
     }
+    if s.len() == 13 {
+        // F3 with 13 digits (every in-window epoch-ms value from 2001 to 2286):
+        // digits 0..5 as "000" + 5 digits, digits 5..13 as 8.
+        let x = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let y = u64::from_le_bytes(s[5..13].try_into().unwrap());
+        if let (Some(hi), Some(lo)) = (swar8(x << 24 | 0x30_3030), swar8(y)) {
+            return Some((hi * 100_000_000 + lo) as i64);
+        }
+    }
     parse_full(s)
 }
 
@@ -293,6 +302,12 @@ mod tests {
             assert_eq!(super::digits(v.to_string().as_bytes()), Some(v as i64));
         }
         assert_eq!(super::digits(b"9223372036854775808"), None);
+        for v in [1000000000000u64, 1791071890000, 9999999999999, 1234567890123] {
+            assert_eq!(parse(v.to_string().as_bytes()), Some(v as i64));
+        }
+        for bad in [&b"179107189000x"[..], b"17910718900:0", b"1791071/90000", b"x791071890000", b"1791071890 00"] {
+            assert_eq!(parse(bad), None, "{:?}", String::from_utf8_lossy(bad));
+        }
         let mut seed = 99u64;
         let alphabet = b"0123456789-T:Zz ";
         for i in 0..200_000 {

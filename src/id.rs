@@ -1,13 +1,13 @@
-//! IDs as `u64` keys.
+//! IDs as `u64` keys, exact for every short ASCII ID.
 //!
-//! A canonical ID (a lowercase letter, then 1 to 11 lowercase base-36 digits
-//! with no leading zero) is packed exactly: `letter << 57 | value`. That covers
-//! every ID the generator writes on purpose (`u3k9x2`, `e1a2b3`, `k9z`, `p123`).
-//! Anything else (`U1`, ` u1`, `c_12`, long strings) becomes a 63-bit hash with
-//! the top bit set; its text is kept in a side table when it may be needed.
+//! - Up to 8 ASCII bytes: `len << 56 | packed`, where `packed` is the 7-bit
+//!   characters squeezed into 56 bits (bit 62 clear).
+//! - 9 ASCII bytes starting with `a`-`z` (the generator's `u…`, `e…`, `k…`):
+//!   `1 << 62 | letter << 56 | packed(rest)`.
+//! - Anything else: a 63-bit hash with the top bit set; its text is kept in a
+//!   side table when it may be needed.
 //! Keys are equal exactly when the strings are (up to 63-bit hash collisions
-//! among the rare non-canonical IDs). Keys do not sort like the strings: use
-//! [`cmp`] for byte order.
+//! among the rare other IDs). Keys do not sort like the strings: use [`cmp`].
 
 use std::sync::{Mutex, OnceLock};
 
@@ -22,37 +22,45 @@ fn table() -> &'static Mutex<FxHashMap<Id, Vec<u8>>> {
     TEXT.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
-/// Base-36 digit value of a lowercase digit or letter, or 255.
-static B36: [u8; 256] = {
-    let mut t = [255u8; 256];
-    let mut i = 0;
-    while i < 10 {
-        t[b'0' as usize + i] = i as u8;
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 26 {
-        t[b'a' as usize + i] = 10 + i as u8;
-        i += 1;
-    }
-    t
-};
+const TAG9: u64 = 1 << 62;
+const HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// Eight 7-bit characters (first in the lowest byte) into 56 bits.
+#[inline(always)]
+fn pack56(x: u64) -> u64 {
+    let y = (x & 0x007F_007F_007F_007F) | (x & 0x7F00_7F00_7F00_7F00) >> 1;
+    let y = (y & 0x0000_3FFF_0000_3FFF) | (y & 0x3FFF_0000_3FFF_0000) >> 2;
+    (y & 0x0000_0000_0FFF_FFFF) | (y & 0x0FFF_FFFF_0000_0000) >> 4
+}
+
+/// Inverse of [`pack56`].
+#[inline(always)]
+fn unpack56(y: u64) -> u64 {
+    let y = (y & 0x0000_0000_0FFF_FFFF) | (y & 0x00FF_FFFF_F000_0000) << 4;
+    let y = (y & 0x0000_3FFF_0000_3FFF) | (y & 0x0FFF_C000_0FFF_C000) << 2;
+    (y & 0x007F_007F_007F_007F) | (y & 0x3F80_3F80_3F80_3F80) << 1
+}
 
 #[inline(always)]
 fn canonical(s: &[u8]) -> Option<u64> {
     let n = s.len();
-    if !(2..=12).contains(&n) || !s[0].is_ascii_lowercase() || (s[1] == b'0' && n > 2) {
-        return None;
-    }
-    let mut v: u64 = 0;
-    for &c in &s[1..] {
-        let d = B36[c as usize];
-        if d == 255 {
+    if n <= 8 {
+        let mut b = [0u8; 8];
+        b[..n].copy_from_slice(s);
+        let x = u64::from_le_bytes(b);
+        if x & HIGH != 0 {
             return None;
         }
-        v = v * 36 + d as u64;
+        Some((n as u64) << 56 | pack56(x))
+    } else if n == 9 && s[0].is_ascii_lowercase() {
+        let x = u64::from_le_bytes(s[1..9].try_into().unwrap());
+        if x & HIGH != 0 {
+            return None;
+        }
+        Some(TAG9 | ((s[0] - b'a') as u64) << 56 | pack56(x))
+    } else {
+        None
     }
-    Some(((s[0] - b'a') as u64) << 57 | v)
 }
 
 #[inline(always)]
@@ -79,25 +87,30 @@ pub fn key_kept(s: &[u8]) -> Id {
     }
 }
 
+/// Text of a non-hashed key into `buf`, returning its length.
+#[inline(always)]
+fn short_text(id: Id, buf: &mut [u8; 9]) -> usize {
+    let raw = unpack56(id & ((1 << 56) - 1)).to_le_bytes();
+    if id & TAG9 != 0 {
+        buf[0] = b'a' + (id >> 56 & 0x1F) as u8;
+        buf[1..9].copy_from_slice(&raw);
+        9
+    } else {
+        let n = (id >> 56 & 0xF) as usize;
+        buf[..8].copy_from_slice(&raw);
+        n
+    }
+}
+
 /// Write the text of a key made by `key_kept` into `out`.
 pub fn text_into(id: Id, out: &mut Vec<u8>) {
     if id & HASHED != 0 {
         out.extend_from_slice(table().lock().unwrap().get(&id).expect("id text"));
         return;
     }
-    out.push(b'a' + (id >> 57) as u8);
-    let mut v = id & ((1 << 57) - 1);
-    let mut buf = [0u8; 12];
-    let mut at = buf.len();
-    loop {
-        at -= 1;
-        buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
-        v /= 36;
-        if v == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&buf[at..]);
+    let mut buf = [0u8; 9];
+    let n = short_text(id, &mut buf);
+    out.extend_from_slice(&buf[..n]);
 }
 
 pub fn text(id: Id) -> Vec<u8> {
@@ -113,31 +126,11 @@ pub fn cmp(a: Id, b: Id) -> std::cmp::Ordering {
         return std::cmp::Ordering::Equal;
     }
     if a & HASHED == 0 && b & HASHED == 0 {
-        let (mut x, mut y) = ([0u8; 12], [0u8; 12]);
-        let (nx, ny) = (canonical_text(a, &mut x), canonical_text(b, &mut y));
+        let (mut x, mut y) = ([0u8; 9], [0u8; 9]);
+        let (nx, ny) = (short_text(a, &mut x), short_text(b, &mut y));
         return x[..nx].cmp(&y[..ny]);
     }
     text(a).cmp(&text(b))
-}
-
-/// Text of a canonical key into `buf`, returning its length.
-#[inline(always)]
-fn canonical_text(id: Id, buf: &mut [u8; 12]) -> usize {
-    let mut digits = [0u8; 11];
-    let mut at = digits.len();
-    let mut v = id & ((1 << 57) - 1);
-    loop {
-        at -= 1;
-        digits[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
-        v /= 36;
-        if v == 0 {
-            break;
-        }
-    }
-    buf[0] = b'a' + (id >> 57) as u8;
-    let n = digits.len() - at;
-    buf[1..1 + n].copy_from_slice(&digits[at..]);
-    1 + n
 }
 
 /// A well-mixed hash of a key, for partitioning.
@@ -156,6 +149,9 @@ mod tests {
         let ids: Vec<&[u8]> = vec![
             b"", b"U1", b"a", b"a0", b"a00", b"ab", b"u1", b"u1 ", b"\tx", b"u10", b"u9", b"uzzzzzzzzzzz",
             b"uzzzzzzzzzzzz", b"c_12", b"k0", b"u01", b"e1a2b3c4d5", b"P123", b"p123",
+            b"uabcdefgh", b"Uabcdefgh", b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f", b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f",
+            b"zzzzzzzzz", b"abcdefgh", b"bcdefgh", b"e\x00", b"e", b"u\x7f\x00\x01\x02\x03\x04\x05\x06",
+            "u\u{e9}".as_bytes(), b"u1\r", b" u1",
         ];
         for a in &ids {
             assert_eq!(text(key_kept(a)), a.to_vec(), "{:?}", String::from_utf8_lossy(a));
