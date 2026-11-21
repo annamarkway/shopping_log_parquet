@@ -112,7 +112,32 @@ pub fn cmp(a: Id, b: Id) -> std::cmp::Ordering {
     if a == b {
         return std::cmp::Ordering::Equal;
     }
+    if a & HASHED == 0 && b & HASHED == 0 {
+        let (mut x, mut y) = ([0u8; 12], [0u8; 12]);
+        let (nx, ny) = (canonical_text(a, &mut x), canonical_text(b, &mut y));
+        return x[..nx].cmp(&y[..ny]);
+    }
     text(a).cmp(&text(b))
+}
+
+/// Text of a canonical key into `buf`, returning its length.
+#[inline(always)]
+fn canonical_text(id: Id, buf: &mut [u8; 12]) -> usize {
+    let mut digits = [0u8; 11];
+    let mut at = digits.len();
+    let mut v = id & ((1 << 57) - 1);
+    loop {
+        at -= 1;
+        digits[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
+        v /= 36;
+        if v == 0 {
+            break;
+        }
+    }
+    buf[0] = b'a' + (id >> 57) as u8;
+    let n = digits.len() - at;
+    buf[1..1 + n].copy_from_slice(&digits[at..]);
+    1 + n
 }
 
 /// A well-mixed hash of a key, for partitioning.
