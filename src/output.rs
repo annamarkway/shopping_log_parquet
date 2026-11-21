@@ -42,7 +42,21 @@ pub fn write_all(ctx: &Ctx, out: &Path, users: &[UserRow], camp: &[CampAgg]) {
     let cd = out.join("campaign_daily");
     fs::create_dir_all(&ud).unwrap();
     fs::create_dir_all(&cd).unwrap();
-    rayon::join(|| write_users(ctx, &ud.join("part-0.parquet"), users), || write_camps(ctx, &cd.join("part-0.parquet"), camp));
+    use rayon::prelude::*;
+    // Row order and file count do not matter: write user_daily in parallel pieces.
+    let pieces = 16;
+    let per = users.len().div_ceil(pieces).max(1);
+    rayon::join(
+        || {
+            users.par_chunks(per).enumerate().for_each(|(i, part)| {
+                write_users(ctx, &ud.join(format!("part-{i}.parquet")), part)
+            });
+            if users.is_empty() {
+                write_users(ctx, &ud.join("part-0.parquet"), users);
+            }
+        },
+        || write_camps(ctx, &cd.join("part-0.parquet"), camp),
+    );
 }
 
 fn write_users(ctx: &Ctx, path: &Path, users: &[UserRow]) {
