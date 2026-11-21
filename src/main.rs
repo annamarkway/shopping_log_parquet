@@ -219,19 +219,23 @@ fn main() {
         (0..Q).into_par_iter().map(|q| sessions_for_partition(&ctx, &recs, &clicks, q)).collect();
     log!("sessions");
 
-    let ncamp = ctx.camp_ids.len();
-    let mut camp = vec![[0u64; 4]; ncamp * ctx.ndays];
-    let mut users: Vec<UserRow> = Vec::with_capacity(results.iter().map(|r| r.0.len()).sum());
-    for (u, c) in results {
-        users.extend(u);
-        for (acc, v) in camp.iter_mut().zip(c) {
-            for k in 0..4 {
-                acc[k] += v[k];
-            }
-        }
-    }
+    let (users, camps): (Vec<Vec<UserRow>>, Vec<Vec<CampAgg>>) = results.into_iter().unzip();
+    let cells = ctx.camp_ids.len() * ctx.ndays;
+    let camp = camps
+        .into_par_iter()
+        .reduce(
+            || vec![[0u64; 4]; cells],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    for k in 0..4 {
+                        x[k] += y[k];
+                    }
+                }
+                a
+            },
+        );
     output::write_all(&ctx, &out, &users, &camp);
-    log!("done: {} user rows", users.len());
+    log!("done: {} user rows", users.iter().map(|u| u.len()).sum::<usize>());
     // Skip freeing everything: the process is about to exit.
     std::mem::forget((recs, clicks, users, event_maps, click_maps, ctx));
 }

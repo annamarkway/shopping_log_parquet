@@ -37,29 +37,30 @@ impl Writer<'_> {
     }
 }
 
-pub fn write_all(ctx: &Ctx, out: &Path, users: &[UserRow], camp: &[CampAgg]) {
+pub fn write_all(ctx: &Ctx, out: &Path, users: &[Vec<UserRow>], camp: &[CampAgg]) {
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     fs::create_dir_all(&ud).unwrap();
     fs::create_dir_all(&cd).unwrap();
     use rayon::prelude::*;
-    // Row order and file count do not matter: write user_daily in parallel pieces.
+    // Row order and file count do not matter: one file per group of partitions.
     let pieces = 16;
     let per = users.len().div_ceil(pieces).max(1);
     rayon::join(
         || {
-            users.par_chunks(per).enumerate().for_each(|(i, part)| {
-                write_users(ctx, &ud.join(format!("part-{i}.parquet")), part)
+            users.par_chunks(per).enumerate().for_each(|(i, group)| {
+                let rows: Vec<&UserRow> = group.iter().flatten().collect();
+                write_users(ctx, &ud.join(format!("part-{i}.parquet")), &rows)
             });
             if users.is_empty() {
-                write_users(ctx, &ud.join("part-0.parquet"), users);
+                write_users(ctx, &ud.join("part-0.parquet"), &[]);
             }
         },
         || write_camps(ctx, &cd.join("part-0.parquet"), camp),
     );
 }
 
-fn write_users(ctx: &Ctx, path: &Path, users: &[UserRow]) {
+fn write_users(ctx: &Ctx, path: &Path, users: &[&UserRow]) {
     let schema = Arc::new(
         parse_message_type(
             "message user_daily {
