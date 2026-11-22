@@ -531,13 +531,17 @@ fn load_links(data: &Path) -> IdMap {
             }
         });
     }
-    let mut links = IdMap::with_capacity(n);
+    let mut pairs: Vec<(Id, Id)> = Vec::with_capacity(n);
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
         let nm = name[r].unwrap();
         if nm != ids[i] {
-            links.insert(ids[i], nm);
+            pairs.push((ids[i], nm));
         }
+    }
+    let mut links = IdMap::with_capacity(pairs.len());
+    for &(k, v) in &pairs {
+        links.insert(k, v);
     }
     links
 }
@@ -624,30 +628,27 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
             let size = (v.len() * 2).next_power_of_two().max(16);
             let mask = size - 1;
             let mut table = vec![u32::MAX; size];
+            // keep[i]: copy i is the earliest-ingested of its event_id so far.
+            let mut keep = vec![0u8; v.len()];
             for (i, e) in v.iter().enumerate() {
                 let mut h = (e.eid.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 32) as usize & mask;
                 loop {
                     let t = table[h];
                     if t == u32::MAX {
                         table[h] = i as u32;
+                        keep[i] = 1;
                         break;
                     }
                     let o = unsafe { v.get_unchecked(t as usize) };
                     if o.eid == e.eid {
                         if e.ingest < o.ingest {
                             table[h] = i as u32;
+                            keep[t as usize] = 0;
+                            keep[i] = 1;
                         }
                         break;
                     }
                     h = (h + 1) & mask;
-                }
-            }
-            // Mark the kept copies, then read the copies in order (the table
-            // order is random, so reading through it misses the cache).
-            let mut keep = vec![0u8; v.len()];
-            for &k in &table {
-                if k != u32::MAX {
-                    unsafe { *keep.get_unchecked_mut(k as usize) = 1 };
                 }
             }
             let mut recs: Vec<Rec> = Vec::with_capacity(v.len());
@@ -655,6 +656,10 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
                 if k != 0 && e.ts != INVALID {
                     recs.push(Rec { person: e.person, ts: e.ts, meta: e.meta });
                 }
+            }
+            if p < 4 && std::env::var_os("SS_DEBUG").is_some() {
+                let hit = recs.iter().filter(|r| links.get(r.person).is_some()).count();
+                eprintln!("dedup {p}: {} copies, {} kept, {hit} linked, table {size}", v.len(), recs.len());
             }
             links.resolve_all(&mut recs, |r| &mut r.person);
             Parted::new(&recs, Q, |r| person_part(r.person))
@@ -708,9 +713,23 @@ struct Groups {
 }
 
 impl Groups {
+    /// For `n` items; persons usually have many each, so the table starts
+    /// small (to stay in cache) and grows.
     fn new(n: usize) -> Self {
-        let size = (n * 2).next_power_of_two().max(16);
+        let size = (n / 8).next_power_of_two().max(64);
         Groups { keys: vec![u64::MAX; size], gid: vec![0; size], mask: size - 1, persons: Vec::new() }
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let size = self.keys.len() * 2;
+        self.keys = vec![u64::MAX; size];
+        self.gid = vec![0; size];
+        self.mask = size - 1;
+        for (g, &k) in self.persons.iter().enumerate() {
+            let h = self.slot(k);
+            self.keys[h] = k;
+            self.gid[h] = g as u32;
+        }
     }
     #[inline(always)]
     fn slot(&self, k: Id) -> usize {
@@ -727,9 +746,14 @@ impl Groups {
     fn insert(&mut self, k: Id) -> u32 {
         let h = self.slot(k);
         if self.keys[h] != k {
+            let g = self.persons.len() as u32;
             self.keys[h] = k;
-            self.gid[h] = self.persons.len() as u32;
+            self.gid[h] = g;
             self.persons.push(k);
+            if self.persons.len() * 2 > self.keys.len() {
+                self.grow();
+            }
+            return g;
         }
         self.gid[h]
     }
@@ -777,6 +801,9 @@ fn sessions_for_partition(
     let mut groups = Groups::new(raw.len());
     let gids: Vec<u32> = raw.iter().map(|e| groups.insert(e.person)).collect();
     let ng = groups.persons.len();
+    if q < 2 && std::env::var_os("SS_DEBUG").is_some() {
+        eprintln!("partition {q}: {} events, {ng} persons, table {}", raw.len(), groups.keys.len());
+    }
     let (mut ev, eoff) = bucket(&raw, &gids, ng, |e| (e.ts as u64) << 32 | e.meta as u64);
     drop(raw);
     for g in 0..ng {

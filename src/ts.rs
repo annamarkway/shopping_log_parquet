@@ -130,10 +130,79 @@ fn digit_bytes(x: u64) -> Option<u64> {
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 /// The `YYYY-MM-DDTHH:MM:SS` start of an F1 or F2 value (`s.len() >= 19`), in
-/// ms, with word-at-a-time checks. `None` means "not sure": the caller falls
-/// back to the full parser (which also covers years outside the table).
+/// ms. `None` means "not sure": the caller falls back to the full parser
+/// (which also covers years outside the table).
 #[inline(always)]
 fn core19(s: &[u8]) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+    {
+        core19_sse(s)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1")))]
+    {
+        core19_swar(s)
+    }
+}
+
+/// [`core19`] in one 16-byte register: gather the 14 digits, check them and
+/// the 5 separators at once, then combine digit pairs with multiply-adds.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+#[inline(always)]
+fn core19_sse(s: &[u8]) -> Option<i64> {
+    use core::arch::x86_64::*;
+    assert!(s.len() >= 19);
+    unsafe {
+        let a = _mm_loadu_si128(s.as_ptr() as *const __m128i); // bytes 0..16
+        let b = _mm_loadu_si128(s.as_ptr().add(3) as *const __m128i); // bytes 3..19
+        // Separators: a[4] '-', a[7] '-', a[10] 'T', a[13] ':', b[13] = s[16] ':'.
+        let sep_a = _mm_setr_epi8(0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0);
+        let sep_b = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b':' as i8, 0, 0);
+        let ma = _mm_movemask_epi8(_mm_cmpeq_epi8(a, sep_a)) as u32;
+        let mb = _mm_movemask_epi8(_mm_cmpeq_epi8(b, sep_b)) as u32;
+        // Digits in order: Y Y Y Y M M D D H H M M (from a) S S (from b), then 2 zeros.
+        let da = _mm_shuffle_epi8(a, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+        let db = _mm_shuffle_epi8(b, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, 15, -1, -1));
+        let zero_pad = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'0' as i8, b'0' as i8);
+        let d = _mm_sub_epi8(_mm_or_si128(_mm_or_si128(da, db), zero_pad), _mm_set1_epi8(b'0' as i8));
+        // Every digit byte at most 9 (as unsigned: anything below '0' wrapped high).
+        let digits_ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) as u32;
+        // Separator bytes a: 4, 7, 10, 13 (0x2490); b: 13 (0x2000).
+        if (ma & 0x2490 != 0x2490) | (mb & 0x2000 == 0) | (digits_ok != 0xFFFF) {
+            return None;
+        }
+        // Pairs: YY, YY, MM, DD, HH, MI, SS, 0 as u16.
+        let p = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+        // Range checks per lane: month 1..12, day 1..31, hour..23, minute..59, second..59.
+        let hi = _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0);
+        let lo = _mm_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0);
+        let bad = _mm_or_si128(_mm_cmpgt_epi16(p, hi), _mm_cmplt_epi16(p, lo));
+        if _mm_movemask_epi8(bad) != 0 {
+            return None;
+        }
+        let year = (_mm_extract_epi16(p, 0) * 100 + _mm_extract_epi16(p, 1)) as usize;
+        let month = _mm_extract_epi16(p, 2) as usize;
+        let day = _mm_extract_epi16(p, 3) as i64;
+        // hour * 3600 + minute * 60 in lane 2, second in lane 3 (as i32).
+        let hms = _mm_madd_epi16(p, _mm_setr_epi16(0, 0, 0, 0, 3600, 60, 1, 0));
+        let secs = (_mm_extract_epi32(hms, 2) + _mm_extract_epi32(hms, 3)) as i64;
+        let y = year.wrapping_sub(TABLE_Y0 as usize);
+        if y >= TABLE_YEARS {
+            return None;
+        }
+        let idx = y * 12 + month - 1;
+        let m0 = *MONTH_START.get_unchecked(idx) as i64;
+        let dim = *MONTH_START.get_unchecked(idx + 1) as i64 - m0;
+        if day > dim {
+            return None;
+        }
+        Some(((m0 + day - 1) * 86_400 + secs) * 1_000)
+    }
+}
+
+/// [`core19`] with word-at-a-time checks.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"), allow(dead_code))]
+#[inline(always)]
+fn core19_swar(s: &[u8]) -> Option<i64> {
     let w = |i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
     let (a, b, c) = (w(0), w(8), w(11)); // "YYYY-MM-", "DDT.....", "HH:MM:SS"
     const AM: u64 = 0xFF00_00FF_0000_0000; // bytes 4 and 7
@@ -365,6 +434,7 @@ mod tests {
                 t[at] = alphabet[(seed >> 50) as usize % alphabet.len()];
             }
             assert_eq!(parse(&t), super::parse_full(&t), "{}", String::from_utf8_lossy(&t));
+            assert_eq!(super::core19(&t), super::core19_swar(&t), "{}", String::from_utf8_lossy(&t));
             // The same with an offset, corrupted too.
             let mut t2 = t.clone();
             t2.truncate(19);

@@ -8,7 +8,13 @@ const EMPTY: Id = u64::MAX;
 pub struct IdMap {
     slots: Vec<(Id, Id)>,
     mask: usize,
+    /// One bit per hash of the keys (a 1-hash Bloom filter, small enough for
+    /// the cache): a clear bit means "not in the map" without touching `slots`.
+    filter: Vec<u64>,
+    fmask: usize,
 }
+
+const FILTER_BITS: usize = 1 << 23;
 
 #[inline(always)]
 pub fn prefetch<T>(p: *const T) {
@@ -25,7 +31,19 @@ pub fn prefetch<T>(p: *const T) {
 impl IdMap {
     pub fn with_capacity(n: usize) -> Self {
         let size = (n * 2).next_power_of_two().max(16);
-        IdMap { slots: vec![(EMPTY, 0); size], mask: size - 1 }
+        let fbits = (n * 8).next_power_of_two().clamp(1 << 12, FILTER_BITS);
+        IdMap { slots: vec![(EMPTY, 0); size], mask: size - 1, filter: vec![0; fbits / 64], fmask: fbits - 1 }
+    }
+
+    #[inline(always)]
+    fn fbit(&self, k: Id) -> usize {
+        (id::mix(k) >> 36) as usize & self.fmask
+    }
+
+    #[inline(always)]
+    fn may_have(&self, k: Id) -> bool {
+        let b = self.fbit(k);
+        unsafe { *self.filter.get_unchecked(b >> 6) >> (b & 63) & 1 != 0 }
     }
 
     #[inline(always)]
@@ -34,6 +52,8 @@ impl IdMap {
     }
 
     pub fn insert(&mut self, k: Id, v: Id) {
+        let b = self.fbit(k);
+        self.filter[b >> 6] |= 1 << (b & 63);
         let mut i = self.home(k);
         loop {
             let s = &mut self.slots[i];
@@ -47,6 +67,9 @@ impl IdMap {
 
     #[inline(always)]
     pub fn get(&self, k: Id) -> Option<Id> {
+        if !self.may_have(k) {
+            return None;
+        }
         let mut i = self.home(k);
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
@@ -61,18 +84,32 @@ impl IdMap {
     }
 
     /// Map every `*key(item)` through the map in place (unmapped keys stay),
-    /// prefetching a few items ahead.
+    /// prefetching ahead in two stages: the filter word far ahead, then the
+    /// slot (only if the filter lets the key through) nearer.
     pub fn resolve_all<T>(&self, items: &mut [T], key: impl Fn(&mut T) -> &mut Id) {
-        const AHEAD: usize = 16;
+        const FAR: usize = 32;
+        const NEAR: usize = 12;
         let n = items.len();
-        for i in 0..n.min(AHEAD) {
+        for i in 0..n.min(FAR) {
             let k = *key(&mut items[i]);
-            prefetch(&self.slots[self.home(k)]);
+            prefetch(&self.filter[self.fbit(k) >> 6]);
+        }
+        for i in 0..n.min(NEAR) {
+            let k = *key(&mut items[i]);
+            if self.may_have(k) {
+                prefetch(&self.slots[self.home(k)]);
+            }
         }
         for i in 0..n {
-            if i + AHEAD < n {
-                let k = *key(&mut items[i + AHEAD]);
-                prefetch(&self.slots[self.home(k)]);
+            if i + FAR < n {
+                let k = *key(&mut items[i + FAR]);
+                prefetch(&self.filter[self.fbit(k) >> 6]);
+            }
+            if i + NEAR < n {
+                let k = *key(&mut items[i + NEAR]);
+                if self.may_have(k) {
+                    prefetch(&self.slots[self.home(k)]);
+                }
             }
             let k = key(&mut items[i]);
             if let Some(v) = self.get(*k) {
@@ -83,5 +120,31 @@ impl IdMap {
 
     pub fn len_hint(&self) -> usize {
         self.slots.len() / 2
+    }
+
+    #[cfg(test)]
+    pub fn test_roundtrip() {
+        let mut m = IdMap::with_capacity(1000);
+        for k in 0..1000u64 {
+            m.insert(k * 7919, k);
+        }
+        for k in 0..20000u64 {
+            let want = (k % 7919 == 0 && k / 7919 < 1000).then_some(k / 7919);
+            assert_eq!(m.get(k), want);
+        }
+        let mut v: Vec<u64> = (0..20000).collect();
+        m.resolve_all(&mut v, |x| x);
+        for (k, &x) in v.iter().enumerate() {
+            let k = k as u64;
+            assert_eq!(x, if k % 7919 == 0 && k / 7919 < 1000 { k / 7919 } else { k });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn roundtrip() {
+        super::IdMap::test_roundtrip();
     }
 }
