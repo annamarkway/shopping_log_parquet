@@ -279,8 +279,9 @@ fn main() {
         (h.join().unwrap(), r)
     });
     log!("events and clicks parsed");
-    let (recs, clicks) = rayon::join(
-        || dedup_events(&links, parsed),
+    // Every ID text is in by now: index them alongside the dedup.
+    let ((recs, ()), clicks) = rayon::join(
+        || rayon::join(|| dedup_events(&links, parsed), id::freeze_texts),
         || {
             raw_clicks
                 .into_par_iter()
@@ -540,10 +541,14 @@ fn load_links(data: &Path) -> IdMap {
     let parts: Vec<Vec<(Id, Id)>> = chunks(&maps)
         .iter()
         .map(|c| {
-            let mut v = Vec::new();
-            csv::scan::<2>(c.bytes, c.first, |[a, b]| {
+            let mut v = Vec::with_capacity(c.bytes.len() / 20);
+            csv::scan_fast::<2>(c.bytes, c.first, |[a, b], slack| {
                 if !a.is_empty() && !b.is_empty() {
-                    v.push((id::key_kept(a), id::key_kept(b)));
+                    v.push(if slack {
+                        unsafe { (id::key_wide::<true>(a), id::key_wide::<true>(b)) }
+                    } else {
+                        (id::key_kept(a), id::key_kept(b))
+                    });
                 }
             });
             v
@@ -650,7 +655,8 @@ fn parse_event(ctx: &Ctx, [eid, user, tsf, ingest, kind, product, price]: [&[u8]
             },
             _ => break 'valid,
         };
-        ev.person = if slack { unsafe { id::key_wide::<true>(user) } } else { id::key_kept(user) };
+        // The input maps live until the process exits, so the text is only logged.
+        ev.person = unsafe { if slack { id::key_wide_logged(user) } else { id::key_logged(user) } };
         ev.ts = (t - ctx.base) as u32;
         ev.meta = meta;
     }

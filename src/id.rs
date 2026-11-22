@@ -32,9 +32,24 @@ unsafe impl Send for Local {}
 
 /// Every thread's table, for lookups of other threads' texts.
 static TABLES: Mutex<Vec<Arc<Local>>> = Mutex::new(Vec::new());
-static FROZEN: OnceLock<Vec<Arc<Local>>> = OnceLock::new();
+
+/// One thread's log of (hashed key, text in the input maps), duplicates and
+/// all: appending is cheaper than looking up. Same access rules as [`Local`].
+struct Log(UnsafeCell<Vec<(Id, u64)>>);
+unsafe impl Sync for Log {}
+unsafe impl Send for Log {}
+static LOGS: Mutex<Vec<Arc<Log>>> = Mutex::new(Vec::new());
+
+const SHARDS: usize = 256;
+/// Every kept and logged text, by key, in shards; built once all are in.
+static FROZEN: OnceLock<Vec<Texts>> = OnceLock::new();
 
 thread_local! {
+    static LOG: Arc<Log> = {
+        let l = Arc::new(Log(UnsafeCell::new(Vec::new())));
+        LOGS.lock().unwrap().push(l.clone());
+        l
+    };
     static LOCAL: Arc<Local> = {
         let t = Arc::new(Local { map: UnsafeCell::new(Texts::default()), arena: UnsafeCell::new((std::ptr::null_mut(), 0)) });
         TABLES.lock().unwrap().push(t.clone());
@@ -86,10 +101,86 @@ fn copy_to_arena(arena: &mut (*mut u8, usize), s: &[u8]) -> u64 {
 fn hashed_text(k: Id, f: impl FnOnce(&[u8])) {
     let own = LOCAL.with(|t| unsafe { (*t.map.get()).get(&k).copied() });
     let v = own.unwrap_or_else(|| {
-        let tables = FROZEN.get_or_init(|| TABLES.lock().unwrap().clone());
-        tables.iter().find_map(|t| unsafe { (*t.map.get()).get(&k).copied() }).expect("id text")
+        let shards = FROZEN.get_or_init(build_frozen);
+        *shards[shard(k)].get(&k).expect("id text")
     });
     f(unpack_text(v))
+}
+
+#[inline(always)]
+fn shard(k: Id) -> usize {
+    (mix(k) >> 40) as usize % SHARDS
+}
+
+/// Index every kept and logged text. Call once every `key_kept` and
+/// `key_logged` call is done (it is also built on the first lookup that
+/// needs it).
+pub fn freeze_texts() {
+    FROZEN.get_or_init(build_frozen);
+}
+
+fn build_frozen() -> Vec<Texts> {
+    use rayon::prelude::*;
+    let logs = LOGS.lock().unwrap().clone();
+    let tables = TABLES.lock().unwrap().clone();
+    // Each log split by shard, then each shard built from every log's part.
+    let split: Vec<Vec<Vec<(Id, u64)>>> = logs
+        .par_iter()
+        .map(|l| {
+            let v = unsafe { &*l.0.get() };
+            let mut parts = vec![Vec::new(); SHARDS];
+            for &(k, t) in v {
+                parts[shard(k)].push((k, t));
+            }
+            parts
+        })
+        .collect();
+    (0..SHARDS)
+        .into_par_iter()
+        .map(|sh| {
+            let mut m = Texts::default();
+            for parts in &split {
+                for &(k, t) in &parts[sh] {
+                    m.entry(k).or_insert(t);
+                }
+            }
+            for t in &tables {
+                for (&k, &v) in unsafe { &*t.map.get() } {
+                    if shard(k) == sh {
+                        m.entry(k).or_insert(v);
+                    }
+                }
+            }
+            m
+        })
+        .collect()
+}
+
+/// Log the text of a hashed key, as a pointer to it.
+#[inline(always)]
+fn log_text(k: Id, s: &[u8]) {
+    let (addr, n) = (s.as_ptr() as u64, s.len() as u64);
+    if addr >= 1 << 48 || n >= 1 << 16 {
+        return keep_text(k, s);
+    }
+    LOG.with(|l| unsafe { (*l.0.get()).push((k, addr | n << 48)) });
+}
+
+/// [`key_kept`] for an ID whose bytes stay where they are until the process
+/// exits (the input maps): its text is only logged by address.
+///
+/// # Safety
+/// `s` must stay valid and unchanged until the process exits.
+#[inline(always)]
+pub unsafe fn key_logged(s: &[u8]) -> Id {
+    match canonical(s) {
+        Some(k) => k,
+        None => {
+            let k = hashed(s);
+            log_text(k, s);
+            k
+        }
+    }
 }
 
 const TAG9: u64 = 1 << 62;
@@ -185,6 +276,19 @@ pub unsafe fn key_wide<const KEPT: bool>(s: &[u8]) -> Id {
         }
     }
     if KEPT { key_kept(s) } else { key(s) }
+}
+
+/// [`key_logged`] reading whole words.
+///
+/// # Safety
+/// As for [`key_wide`] and [`key_logged`].
+#[inline(always)]
+pub unsafe fn key_wide_logged(s: &[u8]) -> Id {
+    let k = unsafe { key_wide::<false>(s) };
+    if k & HASHED != 0 {
+        log_text(k, s);
+    }
+    k
 }
 
 /// Text of a non-hashed key into `buf`, returning its length.
