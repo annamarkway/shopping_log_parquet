@@ -9,17 +9,55 @@
 //! Keys are equal exactly when the strings are (up to 63-bit hash collisions
 //! among the rare other IDs). Keys do not sort like the strings: use [`cmp`].
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
 
 pub type Id = u64;
 const HASHED: u64 = 1 << 63;
 
-static TEXT: OnceLock<Mutex<FxHashMap<Id, Vec<u8>>>> = OnceLock::new();
+type Texts = FxHashMap<Id, Box<[u8]>>;
 
-fn table() -> &'static Mutex<FxHashMap<Id, Vec<u8>>> {
-    TEXT.get_or_init(|| Mutex::new(FxHashMap::default()))
+/// Every thread's table of hashed-ID texts, for the merge.
+static TABLES: Mutex<Vec<Arc<Mutex<Texts>>>> = Mutex::new(Vec::new());
+/// Every thread's table, moved out (not copied) on the first lookup that
+/// needs another thread's text; read without locks from then on.
+static FROZEN: OnceLock<Vec<Texts>> = OnceLock::new();
+
+thread_local! {
+    /// This thread's texts (its lock is only ever contended by the merge).
+    static LOCAL: Arc<Mutex<Texts>> = {
+        let t = Arc::new(Mutex::new(Texts::default()));
+        TABLES.lock().unwrap().push(t.clone());
+        t
+    };
+}
+
+/// Keep the text of a hashed key in this thread's table.
+#[cold]
+#[inline(never)]
+fn keep_text(k: Id, s: &[u8]) {
+    LOCAL.with(|t| {
+        t.lock().unwrap().entry(k).or_insert_with(|| s.into());
+    });
+}
+
+/// The text of a hashed key: this thread's own table first (so a thread can
+/// read back what it kept while others still parse), then the merged table.
+/// The merge must only happen once every `key_kept` call is done.
+fn hashed_text(k: Id, f: impl FnOnce(&[u8])) {
+    let mut f = Some(f);
+    LOCAL.with(|t| {
+        if let Some(v) = t.lock().unwrap().get(&k) {
+            (f.take().unwrap())(v);
+        }
+    });
+    if let Some(f) = f {
+        let tables = FROZEN.get_or_init(|| {
+            TABLES.lock().unwrap().iter().map(|t| std::mem::take(&mut *t.lock().unwrap())).collect()
+        });
+        f(tables.iter().find_map(|t| t.get(&k)).expect("id text"));
+    }
 }
 
 const TAG9: u64 = 1 << 62;
@@ -81,7 +119,7 @@ pub fn key_kept(s: &[u8]) -> Id {
         Some(k) => k,
         None => {
             let k = hashed(s);
-            table().lock().unwrap().entry(k).or_insert_with(|| s.to_vec());
+            keep_text(k, s);
             k
         }
     }
@@ -129,7 +167,7 @@ fn short_text(id: Id, buf: &mut [u8; 9]) -> usize {
 /// Write the text of a key made by `key_kept` into `out`.
 pub fn text_into(id: Id, out: &mut Vec<u8>) {
     if id & HASHED != 0 {
-        out.extend_from_slice(table().lock().unwrap().get(&id).expect("id text"));
+        hashed_text(id, |t| out.extend_from_slice(t));
         return;
     }
     let mut buf = [0u8; 9];
@@ -154,7 +192,30 @@ pub fn cmp(a: Id, b: Id) -> std::cmp::Ordering {
         let (nx, ny) = (short_text(a, &mut x), short_text(b, &mut y));
         return x[..nx].cmp(&y[..ny]);
     }
-    text(a).cmp(&text(b))
+    // The first text goes to a reused buffer: a lookup holds its table's
+    // lock while it runs `f`, so lookups must not nest.
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        with_text(a, |ta| buf.extend_from_slice(ta));
+        let mut r = std::cmp::Ordering::Equal;
+        with_text(b, |tb| r = buf.as_slice().cmp(tb));
+        r
+    })
+}
+
+/// Call `f` with the text of a key made by `key_kept`, without copying it.
+fn with_text(id: Id, f: impl FnOnce(&[u8])) {
+    if id & HASHED != 0 {
+        hashed_text(id, f);
+    } else {
+        let mut buf = [0u8; 9];
+        let n = short_text(id, &mut buf);
+        f(&buf[..n]);
+    }
 }
 
 /// A well-mixed hash of a key, for partitioning.
