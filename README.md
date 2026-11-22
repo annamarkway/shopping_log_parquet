@@ -7,3 +7,5 @@ A native Rust pipeline for the Shopping Sessions challenge. It cleans the event,
 Rescored build of e72fa64 (same code; this commit only touches the README).
 
 Calibration build: code restored from 79e8237 (scored 1.2 s) to measure scorer variation.
+
+Bisect build: code restored from 2acaade.
