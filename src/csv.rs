@@ -266,6 +266,162 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], skip_header: bool, mut f: impl F
     }
 }
 
+/// Bytes readable after the end of a line passed to `scan_fast`'s callback with
+/// `slack == true`.
+pub const SLACK: usize = 16;
+
+/// Same lines and fields as [`scan`], found with fewer branches: separator
+/// positions of a batch of blocks are written out first, then each line is
+/// checked as a whole. A line's quotes are all well placed exactly when the
+/// line holds twice as many quotes as it has fields that are at least 2 bytes
+/// long and start and end with a quote (each such field holds at least those
+/// 2, and any other quote is misplaced).
+/// `slack` is true when [`SLACK`] bytes after the line's end are in `data`.
+#[inline]
+pub fn scan_fast<'a, const N: usize>(data: &'a [u8], skip_header: bool, mut f: impl FnMut([&'a [u8]; N], bool)) {
+    assert!(N >= 2);
+    let mut start = 0;
+    if skip_header {
+        match memchr::memchr(b'\n', data) {
+            Some(e) => start = e + 1,
+            None => return,
+        }
+    }
+    let data = &data[start..];
+    let len = data.len();
+    if len >= u32::MAX as usize - 64 {
+        return scan::<N>(data, false, |x| f(x, false));
+    }
+
+    const BATCH: usize = 32; // blocks
+    // Commas of a batch, those carried from the line before it (at most N - 1),
+    // and room for the unconditional writes and the end markers.
+    let mut cbuf = vec![0u32; BATCH * 64 + N + 80];
+    let mut nbuf = [0u32; BATCH * 64 + 8];
+    let mut nq = [0u32; BATCH * 64 + 8];
+    let cp = cbuf.as_mut_ptr();
+    let mut cn = 0usize; // commas in cbuf
+    let mut ls = 0usize; // start of the current line
+    let mut q_ls = 0u32; // quotes before `ls`
+    let mut qacc = 0u32; // quotes before the current block
+    let mut carry_bad = false; // the current line already has too many commas
+    let mut tail = [0u8; 64];
+    let mut base = 0usize;
+
+    while base < len {
+        let batch_end = (base + BATCH * 64).min(len);
+        let mut nn = 0usize;
+        let mut b = base;
+        while b < batch_end {
+            let block: &[u8; 64] = if b + 64 <= len {
+                unsafe { &*(data.as_ptr().add(b) as *const [u8; 64]) }
+            } else {
+                tail[..len - b].copy_from_slice(&data[b..]);
+                &tail
+            };
+            let m = classify(block);
+            unsafe {
+                let mut s = m.comma;
+                let cnt = s.count_ones() as usize;
+                let p = cp.add(cn);
+                for i in 0..8 {
+                    *p.add(i) = b as u32 + s.trailing_zeros();
+                    s &= s.wrapping_sub(1);
+                }
+                if cnt > 8 {
+                    let mut i = 8;
+                    while s != 0 {
+                        *p.add(i) = b as u32 + s.trailing_zeros();
+                        s &= s - 1;
+                        i += 1;
+                    }
+                }
+                cn += cnt;
+
+                let mut t = m.nl;
+                let cnt = t.count_ones() as usize;
+                for i in 0..2 {
+                    let bit = t.trailing_zeros();
+                    *nbuf.get_unchecked_mut(nn + i) = b as u32 + bit;
+                    let below = if bit >= 64 { m.quote } else { m.quote & ((1u64 << bit) - 1) };
+                    *nq.get_unchecked_mut(nn + i) = qacc + below.count_ones();
+                    t &= t.wrapping_sub(1);
+                }
+                if cnt > 2 {
+                    let mut i = 2;
+                    while t != 0 {
+                        let bit = t.trailing_zeros();
+                        *nbuf.get_unchecked_mut(nn + i) = b as u32 + bit;
+                        *nq.get_unchecked_mut(nn + i) = qacc + (m.quote & ((1u64 << bit) - 1)).count_ones();
+                        t &= t - 1;
+                        i += 1;
+                    }
+                }
+                nn += cnt;
+            }
+            qacc += m.quote.count_ones();
+            b += 64;
+        }
+        for i in 0..N + 8 {
+            cbuf[cn + i] = u32::MAX;
+        }
+
+        let mut ck = 0usize;
+        for i in 0..nn {
+            let n = nbuf[i] as usize;
+            let qline = nq[i].wrapping_sub(q_ls);
+            let ok = !carry_bad
+                && (cbuf[ck + N - 2] as usize) < n
+                && (cbuf[ck + N - 1] as usize) > n
+                && n > ls
+                && n + SLACK <= len;
+            if ok {
+                let mut fields: [&[u8]; N] = [&[]; N];
+                let mut w = 0u32;
+                for (j, fj) in fields.iter_mut().enumerate() {
+                    let s = if j == 0 { ls } else { cbuf[ck + j - 1] as usize + 1 };
+                    let e = if j == N - 1 { n } else { cbuf[ck + j] as usize };
+                    let wrapped = unsafe {
+                        (e >= s + 2) & (*data.get_unchecked(s) == b'"') & (*data.get_unchecked(e.max(1) - 1) == b'"')
+                    } as usize;
+                    *fj = unsafe { data.get_unchecked(s + wrapped..e - wrapped) };
+                    w += wrapped as u32;
+                }
+                if qline == 2 * w {
+                    f(fields, true);
+                }
+                ck += N - 1;
+            } else {
+                while (cbuf[ck] as usize) < n {
+                    ck += 1;
+                }
+                if !carry_bad && n > ls {
+                    if let Some(fs) = split::<N>(&data[ls..n]) {
+                        f(fs, n + SLACK <= len);
+                    }
+                }
+            }
+            carry_bad = false;
+            ls = n + 1;
+            q_ls = nq[i];
+        }
+        let rem = cn - ck;
+        if carry_bad || rem >= N {
+            carry_bad = true;
+            cn = 0;
+        } else {
+            cbuf.copy_within(ck..cn, 0);
+            cn = rem;
+        }
+        base = batch_end;
+    }
+    if ls < len && !carry_bad {
+        if let Some(fs) = split::<N>(&data[ls..len]) {
+            f(fs, false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod scan_tests {
     use super::*;
@@ -283,6 +439,72 @@ mod scan_tests {
         let mut v = Vec::new();
         scan::<N>(data, false, |f| v.push(f.map(|x| x.to_vec())));
         v
+    }
+
+    fn by_scan_fast<const N: usize>(data: &[u8]) -> Vec<[Vec<u8>; N]> {
+        let mut v = Vec::new();
+        scan_fast::<N>(data, false, |f, _| v.push(f.map(|x| x.to_vec())));
+        v
+    }
+
+    #[test]
+    fn scan_fast_matches_split() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..4000 {
+            // Mostly well-formed lines with sprinkled noise, sometimes pure noise,
+            // lengths from tiny to several batches.
+            let n = match round % 4 {
+                0 => (rnd() % 300) as usize + 1,
+                1 => (rnd() % 5000) as usize + 1,
+                _ => (rnd() % 20000) as usize + 1,
+            };
+            let noise = [1u64, 20, 200, 5000][(round / 4) % 4];
+            let mut data = Vec::with_capacity(n);
+            while data.len() < n {
+                if rnd() % 1000 < noise / 5 {
+                    data.push(b"ab,\"\n\r x"[(rnd() % 8) as usize]);
+                    continue;
+                }
+                let nf = 2 + (rnd() % 4) as usize;
+                for j in 0..nf {
+                    let q = rnd() % 3 == 0;
+                    if q { data.push(b'"'); }
+                    for _ in 0..rnd() % 12 { data.push(b'a' + (rnd() % 26) as u8); }
+                    if q { data.push(b'"'); }
+                    if rnd() % 997 < noise / 50 { data.push(b'"'); }
+                    if j + 1 < nf { data.push(b','); }
+                }
+                if rnd() % 50 == 0 {
+                    for _ in 0..rnd() % 3000 { data.push(if rnd() % 3 == 0 { b',' } else { b'x' }); }
+                }
+                data.push(b'\n');
+            }
+            data.truncate(n);
+            assert_eq!(by_scan_fast::<3>(&data), by_split::<3>(&data), "round {round}");
+            assert_eq!(by_scan_fast::<2>(&data), by_split::<2>(&data), "round {round}");
+            assert_eq!(by_scan_fast::<4>(&data), by_split::<4>(&data), "round {round}");
+            assert_eq!(by_scan_fast::<7>(&data), by_split::<7>(&data), "round {round}");
+        }
+        let alphabet = b"ab,\"\n\r x";
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for round in 0..3000 {
+            let n = (round % 300) + 1;
+            let mut data = Vec::with_capacity(n);
+            for _ in 0..n {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                data.push(alphabet[(seed % alphabet.len() as u64) as usize]);
+            }
+            assert_eq!(by_scan_fast::<3>(&data), by_split::<3>(&data));
+            assert_eq!(by_scan_fast::<2>(&data), by_split::<2>(&data));
+        }
     }
 
     #[test]

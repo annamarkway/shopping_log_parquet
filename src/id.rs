@@ -87,6 +87,30 @@ pub fn key_kept(s: &[u8]) -> Id {
     }
 }
 
+/// [`key`] (or [`key_kept`] if `KEPT`) reading whole words.
+///
+/// # Safety
+/// 8 bytes must be readable from `s.as_ptr()` and from `s.as_ptr() + 1`.
+#[inline(always)]
+pub unsafe fn key_wide<const KEPT: bool>(s: &[u8]) -> Id {
+    let n = s.len();
+    let p = s.as_ptr();
+    if n <= 8 {
+        let x = unsafe { (p as *const u64).read_unaligned() };
+        let x = if n == 8 { x } else { x & ((1u64 << (n * 8)) - 1) };
+        if x & HIGH == 0 {
+            return (n as u64) << 56 | pack56(x);
+        }
+    } else if n == 9 {
+        let c = unsafe { *p };
+        let x = unsafe { (p.add(1) as *const u64).read_unaligned() };
+        if c.is_ascii_lowercase() && x & HIGH == 0 {
+            return TAG9 | ((c - b'a') as u64) << 56 | pack56(x);
+        }
+    }
+    if KEPT { key_kept(s) } else { key(s) }
+}
+
 /// Text of a non-hashed key into `buf`, returning its length.
 #[inline(always)]
 fn short_text(id: Id, buf: &mut [u8; 9]) -> usize {
@@ -155,6 +179,11 @@ mod tests {
         ];
         for a in &ids {
             assert_eq!(text(key_kept(a)), a.to_vec(), "{:?}", String::from_utf8_lossy(a));
+            let mut padded = a.to_vec();
+            padded.extend_from_slice(&[0xAA; 16]);
+            let wide = unsafe { key_wide::<true>(&padded[..a.len()]) };
+            assert_eq!(wide, key_kept(a));
+            assert_eq!(unsafe { key_wide::<false>(&padded[..a.len()]) }, key(a));
             for b in &ids {
                 assert_eq!(cmp(key_kept(a), key_kept(b)), a.cmp(b));
                 assert_eq!(key(a) == key(b), a == b);

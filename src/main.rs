@@ -203,11 +203,20 @@ fn main() {
             let n: usize = match mode.as_str() {
                 "lines" => cs.par_iter().map(|c| { let mut n = 0; csv::for_each_line(c.bytes, c.first, |_| n += 1); n }).sum(),
                 "split" => cs.par_iter().map(|c| { let mut n = 0; csv::for_each_line(c.bytes, c.first, |l| if csv::split::<7>(l).is_some() { n += 1 }); n }).sum(),
+                "fast" => cs.par_iter().map(|c| { let mut n = 0; csv::scan_fast::<7>(c.bytes, c.first, |_, _| n += 1); n }).sum(),
+                "pfast" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan_fast::<7>(c.bytes, c.first, |f, sl| if let Some(e) = parse_event(&ctx, f, sl) { n = n.wrapping_add(e.eid ^ e.person ^ e.ts as u64) }); n as usize }).sum(),
+                "f_ing" => cs.par_iter().map(|c| { let mut n = 0i64; csv::scan_fast::<7>(c.bytes, c.first, |f, _| n = n.wrapping_add(ts::parse(f[3]).unwrap_or(1))); n as usize }).sum(),
+                "f_ingp" => cs.par_iter().map(|c| { let mut n = 0i64; csv::scan_fast::<7>(c.bytes, c.first, |f, _| n = n.wrapping_add(probe_ts_parse(f[3]))); n as usize }).sum(),
+                "f_ts" => cs.par_iter().map(|c| { let mut n = 0i64; csv::scan_fast::<7>(c.bytes, c.first, |f, _| n = n.wrapping_add(ts::parse(f[2]).unwrap_or(1))); n as usize }).sum(),
+                "f_eid" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan_fast::<7>(c.bytes, c.first, |f, sl| n = n.wrapping_add(if sl { unsafe { id::key_wide::<false>(f[0]) } } else { 0 })); n as usize }).sum(),
+                "f_user" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan_fast::<7>(c.bytes, c.first, |f, sl| n = n.wrapping_add(if sl { unsafe { id::key_wide::<true>(f[1]) } } else { 0 })); n as usize }).sum(),
+                "f_kind" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan_fast::<7>(c.bytes, c.first, |f, _| n += match f[4] { b"view" | b"cart" => 1, b"purchase" => 2, _ => 3 }); n as usize }).sum(),
+                "f_len" => cs.par_iter().map(|c| { let mut n = 0usize; csv::scan_fast::<7>(c.bytes, c.first, |f, _| n += f.iter().map(|x| x.len()).sum::<usize>()); n }).sum(),
                 "scan" => cs.par_iter().map(|c| { let mut n = 0; csv::scan::<7>(c.bytes, c.first, |_| n += 1); n }).sum(),
-                "parse" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan::<7>(c.bytes, c.first, |f| if let Some(e) = parse_event(&ctx, f) { n = n.wrapping_add(e.eid ^ e.person ^ e.ts as u64) }); n as usize }).sum(),
+                "parse" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan::<7>(c.bytes, c.first, |f| if let Some(e) = parse_event(&ctx, f, false) { n = n.wrapping_add(e.eid ^ e.person ^ e.ts as u64) }); n as usize }).sum(),
                 "keys" => cs.par_iter().map(|c| { let mut n = 0u64; csv::scan::<7>(c.bytes, c.first, |f| { n = n.wrapping_add(id::key(f[0]) ^ id::key(f[1])) }); n as usize }).sum(),
                 "tsonly" => cs.par_iter().map(|c| { let mut n = 0i64; csv::scan::<7>(c.bytes, c.first, |f| { n = n.wrapping_add(ts::parse(f[2]).unwrap_or(0) ^ ts::parse(f[3]).unwrap_or(0)) }); n as usize }).sum(),
-                "store" => cs.par_iter().map(|c| { let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64); csv::scan::<7>(c.bytes, c.first, |f| if let Some(e) = parse_event(&ctx, f) { v.push(e) }); v.len() }).sum(),
+                "store" => cs.par_iter().map(|c| { let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64); csv::scan::<7>(c.bytes, c.first, |f| if let Some(e) = parse_event(&ctx, f, false) { v.push(e) }); v.len() }).sum(),
                 "full" => parse_events(&ctx, &event_maps).iter().map(|p| p.data.len()).sum(),
                 "ts" => cs.par_iter().map(|c| { let mut n = 0; csv::for_each_line(c.bytes, c.first, |l| if let Some(f) = csv::split::<7>(l) { if ts::parse(f[2]).is_some() { n += 1 } if ts::parse(f[3]).is_some() { n += 1 } }); n }).sum(),
                 _ => cs.par_iter().map(|c| c.bytes.iter().map(|&b| b as usize).sum::<usize>()).sum(),
@@ -555,12 +564,14 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 #[inline(always)]
-fn parse_event(ctx: &Ctx, [eid, user, tsf, ingest, kind, product, price]: [&[u8]; 7]) -> Option<Ev> {
+fn parse_event(ctx: &Ctx, [eid, user, tsf, ingest, kind, product, price]: [&[u8]; 7], slack: bool) -> Option<Ev> {
     if eid.is_empty() {
         return None;
     }
     let ingest = ts::parse(ingest).unwrap_or(i64::MAX);
-    let mut ev = Ev { eid: id::key(eid), ingest, person: 0, ts: INVALID, meta: 0 };
+    // With slack, words can be read past any field of the line.
+    let eid = if slack { unsafe { id::key_wide::<false>(eid) } } else { id::key(eid) };
+    let mut ev = Ev { eid, ingest, person: 0, ts: INVALID, meta: 0 };
     (|| {
         if user.is_empty() || product.is_empty() {
             return None;
@@ -576,7 +587,7 @@ fn parse_event(ctx: &Ctx, [eid, user, tsf, ingest, kind, product, price]: [&[u8]
         };
         // The category only matters for purchases (top_category).
         let cat = if price > 0 { product_cat(ctx, product) } else { 0 };
-        ev.person = id::key_kept(user);
+        ev.person = if slack { unsafe { id::key_wide::<true>(user) } } else { id::key_kept(user) };
         ev.ts = (t - ctx.base) as u32;
         ev.meta = price | (cat as u32) << 24;
         Some(())
@@ -590,8 +601,8 @@ fn parse_events(ctx: &Ctx, maps: &[Mmap]) -> Vec<Parted<Ev>> {
         .par_iter()
         .map(|c| {
             let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64);
-            csv::scan::<7>(c.bytes, c.first, |f| {
-                if let Some(ev) = parse_event(ctx, f) {
+            csv::scan_fast::<7>(c.bytes, c.first, |f, slack| {
+                if let Some(ev) = parse_event(ctx, f, slack) {
                     v.push(ev);
                 }
             });
@@ -657,7 +668,7 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
 // ---------------------------------------------------------------- clicks
 
 #[inline(always)]
-fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4]) -> Option<Click> {
+fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4], slack: bool) -> Option<Click> {
     if cid.is_empty() || user.is_empty() {
         return None;
     }
@@ -665,15 +676,21 @@ fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4]) -> Option<Click> {
     if t < ctx.base || t >= ctx.we {
         return None;
     }
-    let camp = *ctx.campaigns.get(&id::key(camp))?;
-    Some(Click { person: id::key_kept(user), cid: id::key_kept(cid), ts: (t - ctx.base) as u32, camp })
+    // With slack, words can be read past any field of the line.
+    let (ck, person, cid) = if slack {
+        unsafe { (id::key_wide::<false>(camp), id::key_wide::<true>(user), id::key_wide::<true>(cid)) }
+    } else {
+        (id::key(camp), id::key_kept(user), id::key_kept(cid))
+    };
+    let camp = *ctx.campaigns.get(&ck)?;
+    Some(Click { person, cid, ts: (t - ctx.base) as u32, camp })
 }
 
 /// Valid clicks of one chunk (duplicates included), by user ID.
 fn parse_clicks(ctx: &Ctx, c: &Chunk) -> Vec<Click> {
     let mut v: Vec<Click> = Vec::with_capacity(c.bytes.len() / 40);
-    csv::scan::<4>(c.bytes, c.first, |f| {
-        if let Some(k) = parse_click(ctx, f) {
+    csv::scan_fast::<4>(c.bytes, c.first, |f, slack| {
+        if let Some(k) = parse_click(ctx, f, slack) {
             v.push(k);
         }
     });
@@ -901,4 +918,10 @@ fn sessions_for_partition(
         }
     }
     (users, camp)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_ts_parse(s: &[u8]) -> i64 {
+    ts::parse(s).unwrap_or(1)
 }

@@ -3,7 +3,7 @@
 
 pub const DAY: i64 = 86_400_000;
 
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let yoe = year - era * 400;
@@ -11,18 +11,20 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }
 
-/// Days since the epoch of the first of each month, years TABLE_Y0 .. +TABLE_YEARS.
+/// Days since the epoch of the first of each month, years TABLE_Y0 .. +TABLE_YEARS,
+/// plus the first of the month after the last (so every month's length is a
+/// difference of neighbours).
 const TABLE_Y0: i64 = 1900;
 const TABLE_YEARS: usize = 400;
-static MONTH_START: std::sync::LazyLock<Vec<i32>> = std::sync::LazyLock::new(|| {
-    let mut t = Vec::with_capacity(TABLE_YEARS * 12);
-    for y in 0..TABLE_YEARS as i64 {
-        for m in 1..=12 {
-            t.push(days_from_civil(TABLE_Y0 + y, m, 1) as i32);
-        }
+static MONTH_START: [i32; TABLE_YEARS * 12 + 1] = {
+    let mut t = [0i32; TABLE_YEARS * 12 + 1];
+    let mut i = 0;
+    while i <= TABLE_YEARS * 12 {
+        t[i] = days_from_civil(TABLE_Y0 + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
     }
     t
-});
+};
 
 #[inline(always)]
 fn days(year: i64, month: i64, day: i64) -> i64 {
@@ -127,20 +129,18 @@ fn digit_bytes(x: u64) -> Option<u64> {
 
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
-/// F1 `YYYY-MM-DDTHH:MM:SSZ` with word-at-a-time checks. `None` means "not a
-/// valid F1": the caller falls back to the full parser.
+/// The `YYYY-MM-DDTHH:MM:SS` start of an F1 or F2 value (`s.len() >= 19`), in
+/// ms, with word-at-a-time checks. `None` means "not sure": the caller falls
+/// back to the full parser (which also covers years outside the table).
 #[inline(always)]
-fn f1_fast(s: &[u8]) -> Option<i64> {
-    if s.len() != 20 || s[19] != b'Z' {
-        return None;
-    }
+fn core19(s: &[u8]) -> Option<i64> {
     let w = |i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
     let (a, b, c) = (w(0), w(8), w(11)); // "YYYY-MM-", "DDT.....", "HH:MM:SS"
     const AM: u64 = 0xFF00_00FF_0000_0000; // bytes 4 and 7
     const AV: u64 = 0x2D00_002D_0000_0000; // '-'
     const CM: u64 = 0x0000_FF00_00FF_0000; // bytes 2 and 5
     const CV: u64 = 0x0000_3A00_003A_0000; // ':'
-    if a & AM != AV || c & CM != CV || (b >> 16) & 0xFF != b'T' as u64 {
+    if (a & AM != AV) | (c & CM != CV) | ((b >> 16) & 0xFF != b'T' as u64) {
         return None;
     }
     let da = digit_bytes(a & !AM | ZEROS & AM)?;
@@ -149,39 +149,78 @@ fn f1_fast(s: &[u8]) -> Option<i64> {
     // Byte i of t is 10 * digit i + digit i+1.
     let pair = |d: u64| d * 10 + (d >> 8);
     let (ta, tb, tc) = (pair(da), pair(db), pair(dc));
-    let year = ((ta & 0xFF) * 100 + (ta >> 16 & 0xFF)) as i64;
-    let month = (ta >> 40 & 0xFF) as i64;
+    let year = ((ta & 0xFF) * 100 + (ta >> 16 & 0xFF)) as usize;
+    let month = (ta >> 40 & 0xFF) as usize;
     let day = (tb & 0xFF) as i64;
     let hour = (tc & 0xFF) as i64;
     let minute = (tc >> 24 & 0xFF) as i64;
     let second = (tc >> 48 & 0xFF) as i64;
-    if !(1..=12).contains(&month)
-        || day < 1
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    let idx = year.wrapping_sub(TABLE_Y0 as usize).wrapping_mul(12).wrapping_add(month.wrapping_sub(1));
+    if (month.wrapping_sub(1) >= 12) | (year.wrapping_sub(TABLE_Y0 as usize) >= TABLE_YEARS) {
         return None;
     }
-    Some((days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000)
+    let m0 = MONTH_START[idx] as i64;
+    let dim = MONTH_START[idx + 1] as i64 - m0;
+    if ((day - 1) as u64 >= dim as u64) | (hour > 23) | (minute > 59) | (second > 59) {
+        return None;
+    }
+    Some(((m0 + day - 1) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000)
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ`; `None` means "use the full parser".
+#[inline(always)]
+fn f1_fast(s: &[u8]) -> Option<i64> {
+    if s.len() != 20 || s[19] != b'Z' {
+        return None;
+    }
+    core19(s)
+}
+
+/// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM`; `None` means "use the full parser".
+#[inline(always)]
+fn f2_fast(s: &[u8]) -> Option<i64> {
+    if s.len() != 25 || s[22] != b':' {
+        return None;
+    }
+    let sign = match s[19] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let v = core19(s)?;
+    let oh = d2(s, 20)?;
+    let om = d2(s, 23)?;
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some(v - sign * (oh * 60 + om) * 60_000)
 }
 
 /// Parse a timestamp to epoch ms. `None` for any malformed value, and for an
 /// F3 number too large for i64 (it is outside every window anyway).
 #[inline(always)]
 pub fn parse(s: &[u8]) -> Option<i64> {
-    if let Some(v) = f1_fast(s) {
-        return Some(v);
-    }
-    if s.len() == 13 {
-        // F3 with 13 digits (every in-window epoch-ms value from 2001 to 2286):
-        // digits 0..5 as "000" + 5 digits, digits 5..13 as 8.
-        let x = u64::from_le_bytes(s[0..8].try_into().unwrap());
-        let y = u64::from_le_bytes(s[5..13].try_into().unwrap());
-        if let (Some(hi), Some(lo)) = (swar8(x << 24 | 0x30_3030), swar8(y)) {
-            return Some((hi * 100_000_000 + lo) as i64);
+    match s.len() {
+        20 => {
+            if let Some(v) = f1_fast(s) {
+                return Some(v);
+            }
         }
+        13 => {
+            // F3 with 13 digits (every in-window epoch-ms value from 2001 to 2286):
+            // digits 0..5 as "000" + 5 digits, digits 5..13 as 8.
+            let x = u64::from_le_bytes(s[0..8].try_into().unwrap());
+            let y = u64::from_le_bytes(s[5..13].try_into().unwrap());
+            if let (Some(hi), Some(lo)) = (swar8(x << 24 | 0x30_3030), swar8(y)) {
+                return Some((hi * 100_000_000 + lo) as i64);
+            }
+        }
+        25 => {
+            if let Some(v) = f2_fast(s) {
+                return Some(v);
+            }
+        }
+        _ => {}
     }
     parse_full(s)
 }
@@ -325,7 +364,16 @@ mod tests {
                 let at = (seed >> 30) as usize % 20;
                 t[at] = alphabet[(seed >> 50) as usize % alphabet.len()];
             }
-            assert_eq!(super::f1_fast(&t).or_else(|| super::parse_full(&t)), super::parse_full(&t), "{}", String::from_utf8_lossy(&t));
+            assert_eq!(parse(&t), super::parse_full(&t), "{}", String::from_utf8_lossy(&t));
+            // The same with an offset, corrupted too.
+            let mut t2 = t.clone();
+            t2.truncate(19);
+            t2.extend_from_slice(if i % 2 == 0 { b"+05:30" } else { b"-11:00" });
+            if i % 5 == 0 {
+                let at = 19 + (seed >> 33) as usize % 6;
+                t2[at] = alphabet[(seed >> 44) as usize % alphabet.len()];
+            }
+            assert_eq!(parse(&t2), super::parse_full(&t2), "{}", String::from_utf8_lossy(&t2));
             if super::f1_fast(&t).is_some() {
                 assert_eq!(super::f1_fast(&t), super::parse_full(&t));
             }
