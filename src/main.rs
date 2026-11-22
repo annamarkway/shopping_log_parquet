@@ -615,27 +615,37 @@ fn parse_event(ctx: &Ctx, [eid, user, tsf, ingest, kind, product, price]: [&[u8]
     // With slack, words can be read past any field of the line.
     let eid = if slack { unsafe { id::key_wide::<false>(eid) } } else { id::key(eid) };
     let mut ev = Ev { eid, ingest, person: 0, ts: INVALID, meta: 0 };
-    (|| {
+    'valid: {
         if user.is_empty() || product.is_empty() {
-            return None;
+            break 'valid;
         }
-        let t = ts::parse(tsf)?;
+        let Some(t) = ts::parse(tsf) else { break 'valid };
         if t < ctx.ws || t >= ctx.we || ingest == i64::MAX || ingest - t > DAY {
-            return None;
+            break 'valid;
         }
-        let price = match kind {
+        let meta = match kind {
             b"view" | b"cart" => 0,
-            b"purchase" => parse_price(price)?,
-            _ => return None,
+            b"purchase" => match purchase_meta(ctx, price, product) {
+                Some(m) => m,
+                None => break 'valid,
+            },
+            _ => break 'valid,
         };
-        // The category only matters for purchases (top_category).
-        let cat = if price > 0 { product_cat(ctx, product) } else { 0 };
         ev.person = if slack { unsafe { id::key_wide::<true>(user) } } else { id::key_kept(user) };
         ev.ts = (t - ctx.base) as u32;
-        ev.meta = price | (cat as u32) << 24;
-        Some(())
-    })();
+        ev.meta = meta;
+    }
     Some(ev)
+}
+
+/// price | category << 24 of a purchase, or `None` if its price is bad.
+/// Out of line: purchases are few, and keeping this here frees registers.
+#[cold]
+#[inline(never)]
+fn purchase_meta(ctx: &Ctx, price: &[u8], product: &[u8]) -> Option<u32> {
+    let price = parse_price(price)?;
+    // The category only matters for purchases (top_category).
+    Some(price | (product_cat(ctx, product) as u32) << 24)
 }
 
 /// Every event copy, per chunk, partitioned by event_id.

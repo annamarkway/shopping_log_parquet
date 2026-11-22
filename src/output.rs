@@ -20,7 +20,7 @@ fn props() -> Arc<WriterProperties> {
     Arc::new(
         WriterProperties::builder()
             .set_dictionary_enabled(true)
-            .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
+            .set_column_dictionary_enabled(ColumnPath::from("user_id"), std::env::var_os("SS_UDICT").is_some())
             .set_statistics_enabled(EnabledStatistics::None)
             .build(),
     )
