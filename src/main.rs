@@ -122,22 +122,8 @@ pub struct Rec {
 struct Click {
     person: Id,
     cid: Id,
-    /// For a hashed click_id: its text in the (still mapped) input, as
-    /// address | length << 48; 0 if its text was kept by `id::key_kept`.
-    ctext: u64,
     ts: u32,
     camp: u16,
-}
-
-/// The text of a click's click_id (for the rare same-time tie).
-fn cid_text(c: &Click) -> std::borrow::Cow<'static, [u8]> {
-    if id::is_hashed(c.cid) && c.ctext != 0 {
-        let (p, n) = ((c.ctext & ((1 << 48) - 1)) as *const u8, (c.ctext >> 48) as usize);
-        // The input maps live until the process exits.
-        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(p, n) })
-    } else {
-        std::borrow::Cow::Owned(id::text(c.cid))
-    }
 }
 
 pub struct UserRow {
@@ -744,24 +730,14 @@ fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4], slack: bool) -> Op
     if t < ctx.base || t >= ctx.we {
         return None;
     }
-    // With slack, words can be read past any field of the line. A click's
-    // user_id text is never needed (persons are named from events and links).
-    let (ck, person, mut ckey) = if slack {
-        unsafe { (id::key_wide::<false>(camp), id::key_wide::<false>(user), id::key_wide::<false>(cid)) }
+    // With slack, words can be read past any field of the line.
+    let (ck, person, cid) = if slack {
+        unsafe { (id::key_wide::<false>(camp), id::key_wide::<true>(user), id::key_wide::<true>(cid)) }
     } else {
-        (id::key(camp), id::key(user), id::key(cid))
+        (id::key(camp), id::key_kept(user), id::key_kept(cid))
     };
     let camp = *ctx.campaigns.get(&ck)?;
-    let mut ctext = 0u64;
-    if id::is_hashed(ckey) {
-        let addr = cid.as_ptr() as u64;
-        if addr < 1 << 48 && cid.len() < 1 << 16 {
-            ctext = addr | (cid.len() as u64) << 48;
-        } else {
-            ckey = id::key_kept(cid);
-        }
-    }
-    Some(Click { person, cid: ckey, ctext, ts: (t - ctx.base) as u32, camp })
+    Some(Click { person, cid, ts: (t - ctx.base) as u32, camp })
 }
 
 /// Valid clicks of one chunk (duplicates included), by user ID.
@@ -939,15 +915,7 @@ fn sessions_for_partition(
         let person = groups.persons[g];
         let pe = &ev[eoff[g] as usize..eoff[g + 1] as usize];
         let pc = &mut ck[coff[g] as usize..coff[g + 1] as usize];
-        pc.sort_unstable_by(|a, b| {
-            a.ts.cmp(&b.ts).then_with(|| {
-                if id::is_hashed(a.cid) || id::is_hashed(b.cid) {
-                    cid_text(b).cmp(&cid_text(a))
-                } else {
-                    id::cmp(b.cid, a.cid)
-                }
-            })
-        });
+        pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| id::cmp(b.cid, a.cid)));
         // Duplicates (same click_id) are now adjacent; drop them in place.
         let mut m = 0;
         for j in 0..pc.len() {

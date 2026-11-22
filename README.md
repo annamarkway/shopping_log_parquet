@@ -9,3 +9,5 @@ Rescored build of e72fa64 (same code; this commit only touches the README).
 Calibration build: code restored from 79e8237 (scored 1.2 s) to measure scorer variation.
 
 Bisect build: code restored from 2acaade.
+
+Main is back on the 79e8237 code (best score, 1.155 s).
