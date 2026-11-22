@@ -72,9 +72,6 @@ pub fn write_all(ctx: &Ctx, out: &Path, users: &[Vec<UserRow>], camp: &[CampAgg]
 }
 
 fn write_users(ctx: &Ctx, path: &Path, users: &[&UserRow]) {
-    if std::env::var_os("SS_OLDPQ").is_none() {
-        return crate::pq::write_users(ctx, path, users);
-    }
     let schema = Arc::new(
         parse_message_type(
             "message user_daily {
@@ -88,23 +85,7 @@ fn write_users(ctx: &Ctx, path: &Path, users: &[&UserRow]) {
         )
         .unwrap(),
     );
-    // All IDs in one buffer, handed out as shared slices (no copy per row).
-    let mut buf: Vec<u8> = Vec::with_capacity(users.len() * 12);
-    let mut ends: Vec<u32> = Vec::with_capacity(users.len());
-    for u in users {
-        id::text_into(u.person, &mut buf);
-        ends.push(buf.len() as u32);
-    }
-    let buf = bytes::Bytes::from(buf);
-    let mut start = 0usize;
-    let names: Vec<ByteArray> = ends
-        .iter()
-        .map(|&e| {
-            let b = ByteArray::from(buf.slice(start..e as usize));
-            start = e as usize;
-            b
-        })
-        .collect();
+    let names: Vec<ByteArray> = users.iter().map(|u| ByteArray::from(id::text(u.person))).collect();
     let days: Vec<i32> = users.iter().map(|u| u.day).collect();
     let sessions: Vec<i64> = users.iter().map(|u| u.sessions as i64).collect();
     let events: Vec<i64> = users.iter().map(|u| u.events as i64).collect();

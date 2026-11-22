@@ -9,7 +9,6 @@
 //! Keys are equal exactly when the strings are (up to 63-bit hash collisions
 //! among the rare other IDs). Keys do not sort like the strings: use [`cmp`].
 
-use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
@@ -17,169 +16,47 @@ use rustc_hash::FxHashMap;
 pub type Id = u64;
 const HASHED: u64 = 1 << 63;
 
-/// Hashed key -> its text, as address | length << 48 into a never-freed arena.
-type Texts = FxHashMap<Id, u64>;
+type Texts = FxHashMap<Id, Box<[u8]>>;
 
-/// One thread's texts. Only its own thread writes them, and only while
-/// parsing; other threads read them only after every `key_kept` call is done
-/// (see [`hashed_text`]), so no lock is needed.
-struct Local {
-    map: UnsafeCell<Texts>,
-    arena: UnsafeCell<(*mut u8, usize)>, // free space in the current arena chunk
-}
-unsafe impl Sync for Local {}
-unsafe impl Send for Local {}
-
-/// Every thread's table, for lookups of other threads' texts.
-static TABLES: Mutex<Vec<Arc<Local>>> = Mutex::new(Vec::new());
-
-/// One thread's log of (hashed key, text in the input maps), duplicates and
-/// all: appending is cheaper than looking up. Same access rules as [`Local`].
-struct Log(UnsafeCell<Vec<(Id, u64)>>);
-unsafe impl Sync for Log {}
-unsafe impl Send for Log {}
-static LOGS: Mutex<Vec<Arc<Log>>> = Mutex::new(Vec::new());
-
-const SHARDS: usize = 256;
-/// Every kept and logged text, by key, in shards; built once all are in.
+/// Every thread's table of hashed-ID texts, for the merge.
+static TABLES: Mutex<Vec<Arc<Mutex<Texts>>>> = Mutex::new(Vec::new());
+/// Every thread's table, moved out (not copied) on the first lookup that
+/// needs another thread's text; read without locks from then on.
 static FROZEN: OnceLock<Vec<Texts>> = OnceLock::new();
 
 thread_local! {
-    static LOG: Arc<Log> = {
-        let l = Arc::new(Log(UnsafeCell::new(Vec::new())));
-        LOGS.lock().unwrap().push(l.clone());
-        l
-    };
-    static LOCAL: Arc<Local> = {
-        let t = Arc::new(Local { map: UnsafeCell::new(Texts::default()), arena: UnsafeCell::new((std::ptr::null_mut(), 0)) });
+    /// This thread's texts (its lock is only ever contended by the merge).
+    static LOCAL: Arc<Mutex<Texts>> = {
+        let t = Arc::new(Mutex::new(Texts::default()));
         TABLES.lock().unwrap().push(t.clone());
         t
     };
 }
 
-#[inline(always)]
-fn unpack_text(v: u64) -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts((v & ((1 << 48) - 1)) as *const u8, (v >> 48) as usize) }
-}
-
-/// Keep the text of a hashed key in this thread's table (copied once, on
-/// the thread's first sight of it).
-#[inline(always)]
-fn keep_text(k: Id, s: &[u8]) {
-    LOCAL.with(|t| {
-        let map = unsafe { &mut *t.map.get() };
-        if !map.contains_key(&k) {
-            let v = unsafe { copy_to_arena(&mut *t.arena.get(), s) };
-            map.insert(k, v);
-        }
-    });
-}
-
+/// Keep the text of a hashed key in this thread's table.
 #[cold]
 #[inline(never)]
-fn copy_to_arena(arena: &mut (*mut u8, usize), s: &[u8]) -> u64 {
-    let n = s.len();
-    assert!(n < 1 << 16, "ID too long");
-    if arena.1 < n {
-        let size = (1 << 20).max(n);
-        arena.0 = Box::leak(vec![0u8; size].into_boxed_slice()).as_mut_ptr();
-        arena.1 = size;
-    }
-    let p = arena.0;
-    unsafe {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), p, n);
-        arena.0 = p.add(n);
-    }
-    arena.1 -= n;
-    assert!((p as u64) < 1 << 48);
-    p as u64 | (n as u64) << 48
+fn keep_text(k: Id, s: &[u8]) {
+    LOCAL.with(|t| {
+        t.lock().unwrap().entry(k).or_insert_with(|| s.into());
+    });
 }
 
 /// The text of a hashed key: this thread's own table first (so a thread can
-/// read back what it kept while others still parse), then every table. The
-/// second only happens once every `key_kept` call is done.
+/// read back what it kept while others still parse), then the merged table.
+/// The merge must only happen once every `key_kept` call is done.
 fn hashed_text(k: Id, f: impl FnOnce(&[u8])) {
-    let own = LOCAL.with(|t| unsafe { (*t.map.get()).get(&k).copied() });
-    let v = own.unwrap_or_else(|| {
-        let shards = FROZEN.get_or_init(build_frozen);
-        *shards[shard(k)].get(&k).expect("id text")
-    });
-    f(unpack_text(v))
-}
-
-#[inline(always)]
-fn shard(k: Id) -> usize {
-    (mix(k) >> 40) as usize % SHARDS
-}
-
-/// Index every kept and logged text. Call once every `key_kept` and
-/// `key_logged` call is done (it is also built on the first lookup that
-/// needs it).
-pub fn freeze_texts() {
-    FROZEN.get_or_init(build_frozen);
-}
-
-fn build_frozen() -> Vec<Texts> {
-    use rayon::prelude::*;
-    let logs = LOGS.lock().unwrap().clone();
-    let tables = TABLES.lock().unwrap().clone();
-    // Each log split by shard, then each shard built from every log's part.
-    let split: Vec<Vec<Vec<(Id, u64)>>> = logs
-        .par_iter()
-        .map(|l| {
-            let v = unsafe { &*l.0.get() };
-            let mut parts = vec![Vec::new(); SHARDS];
-            for &(k, t) in v {
-                parts[shard(k)].push((k, t));
-            }
-            parts
-        })
-        .collect();
-    (0..SHARDS)
-        .into_par_iter()
-        .map(|sh| {
-            let mut m = Texts::default();
-            for parts in &split {
-                for &(k, t) in &parts[sh] {
-                    m.entry(k).or_insert(t);
-                }
-            }
-            for t in &tables {
-                for (&k, &v) in unsafe { &*t.map.get() } {
-                    if shard(k) == sh {
-                        m.entry(k).or_insert(v);
-                    }
-                }
-            }
-            m
-        })
-        .collect()
-}
-
-/// Log the text of a hashed key, as a pointer to it.
-#[inline(always)]
-fn log_text(k: Id, s: &[u8]) {
-    let (addr, n) = (s.as_ptr() as u64, s.len() as u64);
-    if addr >= 1 << 48 || n >= 1 << 16 {
-        return keep_text(k, s);
-    }
-    LOG.with(|l| unsafe { (*l.0.get()).push((k, addr | n << 48)) });
-}
-
-/// [`key_kept`] for an ID whose bytes stay where they are until the process
-/// exits (the input maps): its text is only logged by address.
-///
-/// # Safety
-/// `s` must stay valid and unchanged until the process exits.
-#[inline(always)]
-pub unsafe fn key_logged(s: &[u8]) -> Id {
-    match canonical(s) {
-        Some(k) => k,
-        None => {
-            let k = hashed(s);
-            log_text(k, s);
-            k
+    let mut f = Some(f);
+    LOCAL.with(|t| {
+        if let Some(v) = t.lock().unwrap().get(&k) {
+            (f.take().unwrap())(v);
         }
+    });
+    if let Some(f) = f {
+        let tables = FROZEN.get_or_init(|| {
+            TABLES.lock().unwrap().iter().map(|t| std::mem::take(&mut *t.lock().unwrap())).collect()
+        });
+        f(tables.iter().find_map(|t| t.get(&k)).expect("id text"));
     }
 }
 
@@ -229,12 +106,6 @@ fn hashed(s: &[u8]) -> Id {
     xxhash_rust::xxh3::xxh3_64(s) | HASHED
 }
 
-/// True for a key made by hashing (text not in the key).
-#[inline(always)]
-pub fn is_hashed(id: Id) -> bool {
-    id & HASHED != 0
-}
-
 /// Key for an ID whose text is never needed (equality only).
 #[inline(always)]
 pub fn key(s: &[u8]) -> Id {
@@ -276,19 +147,6 @@ pub unsafe fn key_wide<const KEPT: bool>(s: &[u8]) -> Id {
         }
     }
     if KEPT { key_kept(s) } else { key(s) }
-}
-
-/// [`key_logged`] reading whole words.
-///
-/// # Safety
-/// As for [`key_wide`] and [`key_logged`].
-#[inline(always)]
-pub unsafe fn key_wide_logged(s: &[u8]) -> Id {
-    let k = unsafe { key_wide::<false>(s) };
-    if k & HASHED != 0 {
-        log_text(k, s);
-    }
-    k
 }
 
 /// Text of a non-hashed key into `buf`, returning its length.
