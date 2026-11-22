@@ -59,7 +59,7 @@ static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static PROF: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 const PROF_NAMES: [&str; 17] = [
     "parse: scan+decode", "parse: partition copy", "dedup: gather", "dedup: hash+keep", "dedup: survivors",
-    "dedup: person lookup", "dedup: person copy", "sess: gather events", "sess: group hash",
+    "dedup: person lookup", "dedup: person copy", "freeze texts (+sess gather)", "sess: group hash",
     "sess: bucket events", "sess: sort events", "sess: clicks gather+bucket", "sess: session loop",
     "clicks: parse", "clicks: lookup+copy", "links (own thread)", "output",
 ];
@@ -91,6 +91,8 @@ pub struct Ctx {
     /// Category names sorted byte-wise, so a smaller index is a smaller name.
     pub cat_names: Vec<Vec<u8>>,
     pub campaigns: FxHashMap<Id, u16>,
+    /// Index of campaign `c_<n>` (decimal, no leading zero) at n; u16::MAX if none.
+    pub camp_dense: Vec<u16>,
     /// Index `ncamp - 1` is `organic`.
     pub camp_ids: Vec<Vec<u8>>,
     pub camp_channels: Vec<Vec<u8>>,
@@ -281,7 +283,16 @@ fn main() {
     log!("events and clicks parsed");
     // Every ID text is in by now: index them alongside the dedup.
     let ((recs, ()), clicks) = rayon::join(
-        || rayon::join(|| dedup_events(&links, parsed), id::freeze_texts),
+        || {
+            rayon::join(
+                || dedup_events(&links, parsed),
+                || {
+                    let t = Instant::now();
+                    id::freeze_texts();
+                    prof(7, t);
+                },
+            )
+        },
         || {
             raw_clicks
                 .into_par_iter()
@@ -427,6 +438,15 @@ fn load_ctx(data: &Path) -> Ctx {
     let ndays = ((we - 1).div_euclid(DAY) - day_base + 1) as usize;
 
     let (product_dense, products, unknown_cat, cat_names, campaigns, camp_ids, camp_channels) = load_lookups(data);
+    let mut camp_dense = Vec::new();
+    for (i, c) in camp_ids.iter().enumerate().take(camp_ids.len() - 1) {
+        if let Some(n) = dense_campaign(c) {
+            if camp_dense.len() <= n {
+                camp_dense.resize(n + 1, u16::MAX);
+            }
+            camp_dense[n] = i as u16;
+        }
+    }
     Ctx {
         ws,
         we,
@@ -438,6 +458,7 @@ fn load_ctx(data: &Path) -> Ctx {
         unknown_cat,
         cat_names,
         campaigns,
+        camp_dense,
         camp_ids,
         camp_channels,
     }
@@ -509,6 +530,31 @@ fn dense_product(s: &[u8]) -> Option<usize> {
         n = n * 10 + (c - b'0') as usize;
     }
     Some(n)
+}
+
+/// `n` for a campaign ID `c_<n>`, n decimal without a leading zero, below 10^6.
+#[inline(always)]
+fn dense_campaign(s: &[u8]) -> Option<usize> {
+    if !(3..=8).contains(&s.len()) || s[0] != b'c' || s[1] != b'_' || s[2] == b'0' {
+        return None;
+    }
+    let mut n = 0usize;
+    for &c in &s[2..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as usize;
+    }
+    Some(n)
+}
+
+/// The campaign index of a campaign_id, if it is a known campaign.
+#[inline(always)]
+fn campaign_of(ctx: &Ctx, s: &[u8]) -> Option<u16> {
+    match dense_campaign(s) {
+        Some(n) => ctx.camp_dense.get(n).copied().filter(|&c| c != u16::MAX),
+        None => ctx.campaigns.get(&id::key(s)).copied(),
+    }
 }
 
 #[inline(always)]
@@ -683,6 +729,7 @@ fn parse_events(ctx: &Ctx, maps: &[Mmap]) -> Vec<Parted<Ev>> {
     let parsed: Vec<Parted<Ev>> = chunks(maps)
         .par_iter()
         .map(|c| {
+            let t = Instant::now();
             let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64);
             // Partition sizes counted as the events come.
             let mut off = vec![0u32; P + 1];
@@ -692,7 +739,10 @@ fn parse_events(ctx: &Ctx, maps: &[Mmap]) -> Vec<Parted<Ev>> {
                     v.push(ev);
                 }
             });
-            Parted::scatter(&v, off, |e| eid_part(e.eid))
+            let t = prof(0, t);
+            let r = Parted::scatter(&v, off, |e| eid_part(e.eid));
+            prof(1, t);
+            r
         })
         .collect();
     log!("events parsed");
@@ -704,7 +754,9 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
     let out = (0..P)
         .into_par_iter()
         .map(|p| {
+            let t = Instant::now();
             let v = gather(&parsed, p);
+            let t = prof(2, t);
             // Open addressing on event_id: each slot holds the index of the
             // earliest-ingested copy seen so far (equal ingest_ts copies are identical).
             let size = (v.len() * 2).next_power_of_two().max(16);
@@ -733,6 +785,7 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
                     h = (h + 1) & mask;
                 }
             }
+            let t = prof(3, t);
             let mut recs: Vec<Rec> = Vec::with_capacity(v.len());
             for (e, &k) in v.iter().zip(&keep) {
                 if k != 0 && e.ts != INVALID {
@@ -743,8 +796,12 @@ fn dedup_events(links: &IdMap, parsed: Vec<Parted<Ev>>) -> Vec<Parted<Rec>> {
                 let hit = recs.iter().filter(|r| links.get(r.person).is_some()).count();
                 eprintln!("dedup {p}: {} copies, {} kept, {hit} linked, table {size}", v.len(), recs.len());
             }
+            let t = prof(4, t);
             links.resolve_all(&mut recs, |r| &mut r.person);
-            Parted::new(&recs, Q, |r| person_part(r.person))
+            let t = prof(5, t);
+            let r = Parted::new(&recs, Q, |r| person_part(r.person));
+            prof(6, t);
+            r
         })
         .collect();
     // Free in parallel so later stages reuse these pages instead of fresh, zeroed ones.
@@ -765,12 +822,12 @@ fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4], slack: bool) -> Op
     }
     // With slack, words can be read past any field of the line. A click's
     // user_id text is never needed (persons are named from events and links).
-    let (ck, person, mut ckey) = if slack {
-        unsafe { (id::key_wide::<false>(camp), id::key_wide::<false>(user), id::key_wide::<false>(cid)) }
+    let camp = campaign_of(ctx, camp)?;
+    let (person, mut ckey) = if slack {
+        unsafe { (id::key_wide::<false>(user), id::key_wide::<false>(cid)) }
     } else {
-        (id::key(camp), id::key(user), id::key(cid))
+        (id::key(user), id::key(cid))
     };
-    let camp = *ctx.campaigns.get(&ck)?;
     let mut ctext = 0u64;
     if id::is_hashed(ckey) {
         let addr = cid.as_ptr() as u64;
