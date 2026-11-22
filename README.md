@@ -17,3 +17,5 @@ Main on fastparse 85ba875: purpose-built Parquet writer.
 Main on exp-a: 79e8237 + read-ahead hints.
 
 Main on exp-b: 79e8237 + purpose-built Parquet writer.
+
+Main on exp-c: exp-b + self-contained parse speedups.

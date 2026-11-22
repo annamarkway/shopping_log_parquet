@@ -106,6 +106,12 @@ fn hashed(s: &[u8]) -> Id {
     xxhash_rust::xxh3::xxh3_64(s) | HASHED
 }
 
+/// True for a key made by hashing (text not in the key).
+#[inline(always)]
+pub fn is_hashed(id: Id) -> bool {
+    id & HASHED != 0
+}
+
 /// Key for an ID whose text is never needed (equality only).
 #[inline(always)]
 pub fn key(s: &[u8]) -> Id {
