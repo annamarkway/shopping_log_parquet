@@ -92,8 +92,6 @@ pub struct Ctx {
     /// Category names sorted byte-wise, so a smaller index is a smaller name.
     pub cat_names: Vec<Vec<u8>>,
     pub campaigns: FxHashMap<Id, u16>,
-    /// Index of campaign `c_<n>` (decimal, no leading zero) at n; u16::MAX if none.
-    pub camp_dense: Vec<u16>,
     /// Index `ncamp - 1` is `organic`.
     pub camp_ids: Vec<Vec<u8>>,
     pub camp_channels: Vec<Vec<u8>>,
@@ -125,22 +123,8 @@ pub struct Rec {
 struct Click {
     person: Id,
     cid: Id,
-    /// For a hashed click_id: its text in the (still mapped) input, as
-    /// address | length << 48; 0 if its text was kept by `id::key_kept`.
-    ctext: u64,
     ts: u32,
     camp: u16,
-}
-
-/// The text of a click's click_id (for the rare same-time tie).
-fn cid_text(c: &Click) -> std::borrow::Cow<'static, [u8]> {
-    if id::is_hashed(c.cid) && c.ctext != 0 {
-        let (p, n) = ((c.ctext & ((1 << 48) - 1)) as *const u8, (c.ctext >> 48) as usize);
-        // The input maps live until the process exits.
-        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(p, n) })
-    } else {
-        std::borrow::Cow::Owned(id::text(c.cid))
-    }
 }
 
 pub struct UserRow {
@@ -167,11 +151,6 @@ impl<T: Copy> Parted<T> {
         for it in items {
             off[part(it) + 1] += 1;
         }
-        Self::scatter(items, off, part)
-    }
-    /// With `off[p + 1]` already counting the items of partition `p`.
-    fn scatter(items: &[T], mut off: Vec<u32>, part: impl Fn(&T) -> usize) -> Self {
-        let n = off.len() - 1;
         for p in 0..n {
             off[p + 1] += off[p];
         }
@@ -429,15 +408,6 @@ fn load_ctx(data: &Path) -> Ctx {
     let ndays = ((we - 1).div_euclid(DAY) - day_base + 1) as usize;
 
     let (product_dense, products, unknown_cat, cat_names, campaigns, camp_ids, camp_channels) = load_lookups(data);
-    let mut camp_dense = Vec::new();
-    for (i, c) in camp_ids.iter().enumerate().take(camp_ids.len() - 1) {
-        if let Some(n) = dense_campaign(c) {
-            if camp_dense.len() <= n {
-                camp_dense.resize(n + 1, u16::MAX);
-            }
-            camp_dense[n] = i as u16;
-        }
-    }
     Ctx {
         ws,
         we,
@@ -449,7 +419,6 @@ fn load_ctx(data: &Path) -> Ctx {
         unknown_cat,
         cat_names,
         campaigns,
-        camp_dense,
         camp_ids,
         camp_channels,
     }
@@ -523,31 +492,6 @@ fn dense_product(s: &[u8]) -> Option<usize> {
     Some(n)
 }
 
-/// `n` for a campaign ID `c_<n>`, n decimal without a leading zero, below 10^6.
-#[inline(always)]
-fn dense_campaign(s: &[u8]) -> Option<usize> {
-    if !(3..=8).contains(&s.len()) || s[0] != b'c' || s[1] != b'_' || s[2] == b'0' {
-        return None;
-    }
-    let mut n = 0usize;
-    for &c in &s[2..] {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        n = n * 10 + (c - b'0') as usize;
-    }
-    Some(n)
-}
-
-/// The campaign index of a campaign_id, if it is a known campaign.
-#[inline(always)]
-fn campaign_of(ctx: &Ctx, s: &[u8]) -> Option<u16> {
-    match dense_campaign(s) {
-        Some(n) => ctx.camp_dense.get(n).copied().filter(|&c| c != u16::MAX),
-        None => ctx.campaigns.get(&id::key(s)).copied(),
-    }
-}
-
 #[inline(always)]
 fn product_cat(ctx: &Ctx, s: &[u8]) -> u8 {
     match dense_product(s) {
@@ -579,13 +523,9 @@ fn load_links(data: &Path) -> IdMap {
         .iter()
         .map(|c| {
             let mut v = Vec::new();
-            csv::scan_fast::<2>(c.bytes, c.first, |[a, b], slack| {
+            csv::scan::<2>(c.bytes, c.first, |[a, b]| {
                 if !a.is_empty() && !b.is_empty() {
-                    v.push(if slack {
-                        unsafe { (id::key_wide::<true>(a), id::key_wide::<true>(b)) }
-                    } else {
-                        (id::key_kept(a), id::key_kept(b))
-                    });
+                    v.push((id::key_kept(a), id::key_kept(b)));
                 }
             });
             v
@@ -709,26 +649,18 @@ fn purchase_meta(ctx: &Ctx, price: &[u8], product: &[u8]) -> Option<u32> {
     Some(price | (product_cat(ctx, product) as u32) << 24)
 }
 
-#[inline(always)]
-fn eid_part(eid: Id) -> usize {
-    (id::mix(eid) >> 40) as usize % P
-}
-
 /// Every event copy, per chunk, partitioned by event_id.
 fn parse_events(ctx: &Ctx, maps: &[Mmap]) -> Vec<Parted<Ev>> {
     let parsed: Vec<Parted<Ev>> = chunks(maps)
         .par_iter()
         .map(|c| {
             let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64);
-            // Partition sizes counted as the events come.
-            let mut off = vec![0u32; P + 1];
             csv::scan_fast::<7>(c.bytes, c.first, |f, slack| {
                 if let Some(ev) = parse_event(ctx, f, slack) {
-                    off[eid_part(ev.eid) + 1] += 1;
                     v.push(ev);
                 }
             });
-            Parted::scatter(&v, off, |e| eid_part(e.eid))
+            Parted::new(&v, P, |e| (id::mix(e.eid) >> 40) as usize % P)
         })
         .collect();
     log!("events parsed");
@@ -799,24 +731,14 @@ fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4], slack: bool) -> Op
     if t < ctx.base || t >= ctx.we {
         return None;
     }
-    let camp = campaign_of(ctx, camp)?;
-    // With slack, words can be read past any field of the line. A click's
-    // user_id text is never needed (persons are named from events and links).
-    let (person, mut ckey) = if slack {
-        unsafe { (id::key_wide::<false>(user), id::key_wide::<false>(cid)) }
+    // With slack, words can be read past any field of the line.
+    let (ck, person, cid) = if slack {
+        unsafe { (id::key_wide::<false>(camp), id::key_wide::<true>(user), id::key_wide::<true>(cid)) }
     } else {
-        (id::key(user), id::key(cid))
+        (id::key(camp), id::key_kept(user), id::key_kept(cid))
     };
-    let mut ctext = 0u64;
-    if id::is_hashed(ckey) {
-        let addr = cid.as_ptr() as u64;
-        if addr < 1 << 48 && cid.len() < 1 << 16 {
-            ctext = addr | (cid.len() as u64) << 48;
-        } else {
-            ckey = id::key_kept(cid);
-        }
-    }
-    Some(Click { person, cid: ckey, ctext, ts: (t - ctx.base) as u32, camp })
+    let camp = *ctx.campaigns.get(&ck)?;
+    Some(Click { person, cid, ts: (t - ctx.base) as u32, camp })
 }
 
 /// Valid clicks of one chunk (duplicates included), by user ID.
@@ -994,15 +916,7 @@ fn sessions_for_partition(
         let person = groups.persons[g];
         let pe = &ev[eoff[g] as usize..eoff[g + 1] as usize];
         let pc = &mut ck[coff[g] as usize..coff[g + 1] as usize];
-        pc.sort_unstable_by(|a, b| {
-            a.ts.cmp(&b.ts).then_with(|| {
-                if id::is_hashed(a.cid) || id::is_hashed(b.cid) {
-                    cid_text(b).cmp(&cid_text(a))
-                } else {
-                    id::cmp(b.cid, a.cid)
-                }
-            })
-        });
+        pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| id::cmp(b.cid, a.cid)));
         // Duplicates (same click_id) are now adjacent; drop them in place.
         let mut m = 0;
         for j in 0..pc.len() {

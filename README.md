@@ -21,3 +21,5 @@ Main on exp-b: 79e8237 + purpose-built Parquet writer.
 Main on exp-c: exp-b + self-contained parse speedups.
 
 Rescore of exp-c (no code change).
+
+Rescore of exp-b (code identical to b54e2b7).
