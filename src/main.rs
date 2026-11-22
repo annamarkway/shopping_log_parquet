@@ -164,6 +164,11 @@ impl<T: Copy> Parted<T> {
         for it in items {
             off[part(it) + 1] += 1;
         }
+        Self::scatter(items, off, part)
+    }
+    /// With `off[p + 1]` already counting the items of partition `p`.
+    fn scatter(items: &[T], mut off: Vec<u32>, part: impl Fn(&T) -> usize) -> Self {
+        let n = off.len() - 1;
         for p in 0..n {
             off[p + 1] += off[p];
         }
@@ -662,18 +667,26 @@ fn purchase_meta(ctx: &Ctx, price: &[u8], product: &[u8]) -> Option<u32> {
     Some(price | (product_cat(ctx, product) as u32) << 24)
 }
 
+#[inline(always)]
+fn eid_part(eid: Id) -> usize {
+    (id::mix(eid) >> 40) as usize % P
+}
+
 /// Every event copy, per chunk, partitioned by event_id.
 fn parse_events(ctx: &Ctx, maps: &[Mmap]) -> Vec<Parted<Ev>> {
     let parsed: Vec<Parted<Ev>> = chunks(maps)
         .par_iter()
         .map(|c| {
             let mut v: Vec<Ev> = Vec::with_capacity(c.bytes.len() / 64);
+            // Partition sizes counted as the events come.
+            let mut off = vec![0u32; P + 1];
             csv::scan_fast::<7>(c.bytes, c.first, |f, slack| {
                 if let Some(ev) = parse_event(ctx, f, slack) {
+                    off[eid_part(ev.eid) + 1] += 1;
                     v.push(ev);
                 }
             });
-            Parted::new(&v, P, |e| (id::mix(e.eid) >> 40) as usize % P)
+            Parted::scatter(&v, off, |e| eid_part(e.eid))
         })
         .collect();
     log!("events parsed");
