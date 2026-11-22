@@ -11,3 +11,5 @@ Calibration build: code restored from 79e8237 (scored 1.2 s) to measure scorer v
 Bisect build: code restored from 2acaade.
 
 Main is back on the 79e8237 code (best score, 1.155 s).
+
+Main on fastparse 85ba875: purpose-built Parquet writer.
