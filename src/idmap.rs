@@ -15,6 +15,7 @@ pub struct IdMap {
 }
 
 const FILTER_BITS: usize = 1 << 23;
+const USE_FILTER: bool = option_env!("SS_NOFILTER").is_none();
 
 #[inline(always)]
 pub fn prefetch<T>(p: *const T) {
@@ -42,6 +43,9 @@ impl IdMap {
 
     #[inline(always)]
     fn may_have(&self, k: Id) -> bool {
+        if !USE_FILTER {
+            return true;
+        }
         let b = self.fbit(k);
         unsafe { *self.filter.get_unchecked(b >> 6) >> (b & 63) & 1 != 0 }
     }
@@ -92,7 +96,9 @@ impl IdMap {
         let n = items.len();
         for i in 0..n.min(FAR) {
             let k = *key(&mut items[i]);
-            prefetch(&self.filter[self.fbit(k) >> 6]);
+            if USE_FILTER {
+                prefetch(&self.filter[self.fbit(k) >> 6]);
+            }
         }
         for i in 0..n.min(NEAR) {
             let k = *key(&mut items[i]);
@@ -101,7 +107,7 @@ impl IdMap {
             }
         }
         for i in 0..n {
-            if i + FAR < n {
+            if USE_FILTER && i + FAR < n {
                 let k = *key(&mut items[i + FAR]);
                 prefetch(&self.filter[self.fbit(k) >> 6]);
             }

@@ -55,6 +55,21 @@ const INVALID: u32 = u32::MAX;
 
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+// Measurement (SS_PROF): thread-time per step, summed over all tasks.
+static PROF: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+const PROF_NAMES: [&str; 17] = [
+    "parse: scan+decode", "parse: partition copy", "dedup: gather", "dedup: hash+keep", "dedup: survivors",
+    "dedup: person lookup", "dedup: person copy", "sess: gather events", "sess: group hash",
+    "sess: bucket events", "sess: sort events", "sess: clicks gather+bucket", "sess: session loop",
+    "clicks: parse", "clicks: lookup+copy", "links (own thread)", "output",
+];
+#[inline(always)]
+fn prof(i: usize, t: Instant) -> Instant {
+    let now = Instant::now();
+    PROF[i].fetch_add((now - t).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    now
+}
+
 macro_rules! log {
     ($($arg:tt)*) => {
         eprintln!("[{:>7.1} ms] {}", T0.get().unwrap().elapsed().as_secs_f64() * 1e3, format!($($arg)*))
@@ -232,7 +247,9 @@ fn main() {
     // event chunk.
     let (links, (parsed, raw_clicks)) = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
+            let t = Instant::now();
             let l = load_links(&data);
+            prof(15, t);
             log!("links: {} slots", l.len_hint());
             l
         });
@@ -249,34 +266,50 @@ fn main() {
             raw_clicks
                 .into_par_iter()
                 .map(|mut v| {
+                    let t = Instant::now();
                     links.resolve_all(&mut v, |k| &mut k.person);
-                    Parted::new(&v, Q, |k| person_part(k.person))
+                    let r = Parted::new(&v, Q, |k| person_part(k.person));
+                    prof(14, t);
+                    r
                 })
                 .collect::<Vec<_>>()
         },
     );
     log!("events and clicks partitioned by person");
 
-    let results: Vec<(Vec<UserRow>, Vec<CampAgg>)> =
-        (0..Q).into_par_iter().map(|q| sessions_for_partition(&ctx, &recs, &clicks, q)).collect();
+    // One accumulator set per fold (about one per thread), reused across partitions.
+    let states: Vec<(SessState, Vec<Vec<UserRow>>)> = (0..Q)
+        .into_par_iter()
+        .fold(
+            || (SessState::new(&ctx), Vec::new()),
+            |(mut st, mut us), q| {
+                us.push(sessions_for_partition(&ctx, &recs, &clicks, q, &mut st));
+                (st, us)
+            },
+        )
+        .collect();
     log!("sessions");
 
-    let (users, camps): (Vec<Vec<UserRow>>, Vec<Vec<CampAgg>>) = results.into_iter().unzip();
-    let cells = ctx.camp_ids.len() * ctx.ndays;
-    let camp = camps
-        .into_par_iter()
-        .reduce(
-            || vec![[0u64; 4]; cells],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(&b) {
-                    for k in 0..4 {
-                        x[k] += y[k];
-                    }
-                }
-                a
-            },
-        );
+    let ncamp = ctx.camp_ids.len();
+    let nd = ctx.ndays;
+    let mut camp = vec![[0u64; 4]; ncamp * nd];
+    let mut users: Vec<Vec<UserRow>> = Vec::with_capacity(Q);
+    for (st, us) in states {
+        for (x, y) in camp.iter_mut().zip(&st.camp) {
+            for k in 0..3 {
+                x[k] += y[k];
+            }
+        }
+        for di in 0..nd {
+            for c in 0..ncamp {
+                camp[c * nd + di][3] += st.asst[di * ncamp + c] as u64;
+            }
+        }
+        users.extend(us);
+    }
+    let t = Instant::now();
     output::write_all(&ctx, &out, &users, &camp);
+    prof(16, t);
     log!("done: {} user rows", users.iter().map(|u| u.len()).sum::<usize>());
     if std::env::var_os("SS_DEBUG").is_some() {
         if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
@@ -286,6 +319,12 @@ fn main() {
         }
     }
     // Skip freeing everything: the process is about to exit.
+    if std::env::var_os("SS_PROF").is_some() {
+        for (i, n) in PROF_NAMES.iter().enumerate() {
+            let v = PROF[i].load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("prof {n:<28} {:>8.1} thread-ms", v as f64 / 1e6);
+        }
+    }
     std::mem::forget((recs, clicks, users, event_maps, click_maps, ctx));
 }
 
@@ -693,12 +732,14 @@ fn parse_click(ctx: &Ctx, [cid, user, camp, tsf]: [&[u8]; 4], slack: bool) -> Op
 
 /// Valid clicks of one chunk (duplicates included), by user ID.
 fn parse_clicks(ctx: &Ctx, c: &Chunk) -> Vec<Click> {
+    let t = Instant::now();
     let mut v: Vec<Click> = Vec::with_capacity(c.bytes.len() / 40);
     csv::scan_fast::<4>(c.bytes, c.first, |f, slack| {
         if let Some(k) = parse_click(ctx, f, slack) {
             v.push(k);
         }
     });
+    prof(13, t);
     v
 }
 
@@ -789,26 +830,60 @@ fn bucket<T: Copy, U: Copy>(items: &[T], gids: &[u32], ng: usize, map: impl Fn(&
     (out, off)
 }
 
+/// Campaign accumulators and scratch shared by the partitions one fold handles.
+struct SessState {
+    /// [campaign][day]: sessions, purchasing sessions, revenue (assists in `asst`).
+    camp: Vec<CampAgg>,
+    /// Assisted sessions as [day][campaign]: one session's increments share a row.
+    asst: Vec<u32>,
+    /// Clicks per campaign in the current 7-day window, and the campaigns with
+    /// at least one (`active`, with each one's index in it in `at`).
+    cnt: Vec<u32>,
+    at: Vec<u32>,
+    active: Vec<u16>,
+    catrev: Vec<u64>,
+}
+
+impl SessState {
+    fn new(ctx: &Ctx) -> Self {
+        let (ncamp, nd) = (ctx.camp_ids.len(), ctx.ndays);
+        SessState {
+            camp: vec![[0u64; 4]; ncamp * nd],
+            asst: vec![0u32; nd * ncamp],
+            cnt: vec![0u32; ncamp],
+            at: vec![0u32; ncamp],
+            active: Vec::new(),
+            catrev: vec![0u64; ctx.cat_names.len()],
+        }
+    }
+}
+
 fn sessions_for_partition(
     ctx: &Ctx,
     recs: &[Parted<Rec>],
     clicks: &[Parted<Click>],
     q: usize,
-) -> (Vec<UserRow>, Vec<CampAgg>) {
+    st: &mut SessState,
+) -> Vec<UserRow> {
     // Events grouped by person, each group sorted by ts. An event is packed as
     // ts << 32 | meta, so sorting the u64s sorts by ts.
+    let t = Instant::now();
     let raw = gather(recs, q);
+    let t = prof(7, t);
     let mut groups = Groups::new(raw.len());
     let gids: Vec<u32> = raw.iter().map(|e| groups.insert(e.person)).collect();
     let ng = groups.persons.len();
+    let t = prof(8, t);
     if q < 2 && std::env::var_os("SS_DEBUG").is_some() {
         eprintln!("partition {q}: {} events, {ng} persons, table {}", raw.len(), groups.keys.len());
     }
     let (mut ev, eoff) = bucket(&raw, &gids, ng, |e| (e.ts as u64) << 32 | e.meta as u64);
     drop(raw);
+    let t = prof(9, t);
     for g in 0..ng {
         ev[eoff[g] as usize..eoff[g + 1] as usize].sort_unstable();
     }
+    let t = prof(10, t);
 
     // Clicks of the same persons (others can credit nothing), each group by
     // time, then click_id descending: the last click at or before a session
@@ -817,21 +892,14 @@ fn sessions_for_partition(
     let cg: Vec<u32> = raw.iter().map(|k| groups.get(k.person).unwrap_or(u32::MAX)).collect();
     let (mut ck, coff) = bucket(&raw, &cg, ng, |k| *k);
     drop(raw);
+    let t = prof(11, t);
 
     let ncamp = ctx.camp_ids.len();
     let nd = ctx.ndays;
     let organic = ncamp - 1;
     let reach = CLICK_REACH as u32;
-    let mut camp = vec![[0u64; 4]; ncamp * nd];
+    let SessState { camp, asst, cnt, at, active, catrev } = st;
     let mut users = Vec::new();
-    // Clicks per campaign in the current 7-day window, and the campaigns with
-    // at least one (`active`, with each one's index in it in `at`).
-    let mut cnt = vec![0u32; ncamp];
-    let mut at = vec![0u32; ncamp];
-    let mut active: Vec<u16> = Vec::new();
-    // Assisted sessions as [day][campaign]: one session's increments share a row.
-    let mut asst = vec![0u32; nd * ncamp];
-    let mut catrev = vec![0u64; ctx.cat_names.len()];
 
     for g in 0..ng {
         let person = groups.persons[g];
@@ -855,13 +923,16 @@ fn sessions_for_partition(
                 return;
             }
             let mut top: Option<u8> = None;
-            let mut best = 0u64;
-            for (c, v) in catrev.iter_mut().enumerate() {
-                if *v > best {
-                    best = *v;
-                    top = Some(c as u8);
+            // Category revenue is only ever added with a purchase.
+            if r > 0 {
+                let mut best = 0u64;
+                for (c, v) in catrev.iter_mut().enumerate() {
+                    if *v > best {
+                        best = *v;
+                        top = Some(c as u8);
+                    }
+                    *v = 0;
                 }
-                *v = 0;
             }
             users.push(UserRow { person, day: day as i32, sessions: s, events: e, revenue: r, top });
         };
@@ -874,7 +945,7 @@ fn sessions_for_partition(
             let (mut n, mut rev, mut bought) = (0u64, 0u64, false);
             let sday = (ctx.base + start as i64).div_euclid(DAY);
             if sday != day {
-                flush(day, d_sessions, d_events, d_revenue, &mut catrev, &mut users);
+                flush(day, d_sessions, d_events, d_revenue, catrev, &mut users);
                 day = sday;
                 d_sessions = 0;
                 d_events = 0;
@@ -929,22 +1000,18 @@ fn sessions_for_partition(
             a[1] += bought as u64;
             a[2] += rev;
             let row = &mut asst[di * ncamp..(di + 1) * ncamp];
-            for &c in &active {
+            for &c in active.iter() {
                 unsafe { *row.get_unchecked_mut(c as usize) += 1 };
             }
         }
-        flush(day, d_sessions, d_events, d_revenue, &mut catrev, &mut users);
-        for &c in &active {
+        flush(day, d_sessions, d_events, d_revenue, catrev, &mut users);
+        for &c in active.iter() {
             cnt[c as usize] = 0;
         }
         active.clear();
     }
-    for di in 0..nd {
-        for c in 0..ncamp {
-            camp[c * nd + di][3] += asst[di * ncamp + c] as u64;
-        }
-    }
-    (users, camp)
+    prof(12, t);
+    users
 }
 
 #[unsafe(no_mangle)]
