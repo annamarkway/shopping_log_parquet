@@ -72,6 +72,9 @@ pub fn write_all(ctx: &Ctx, out: &Path, users: &[Vec<UserRow>], camp: &[CampAgg]
 }
 
 fn write_users(ctx: &Ctx, path: &Path, users: &[&UserRow]) {
+    if std::env::var_os("SS_OLDPQ").is_none() {
+        return crate::pq::write_users(ctx, path, users);
+    }
     let schema = Arc::new(
         parse_message_type(
             "message user_daily {

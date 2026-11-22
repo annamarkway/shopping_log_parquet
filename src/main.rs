@@ -12,6 +12,7 @@ mod csv;
 mod id;
 mod idmap;
 mod output;
+mod pq;
 mod ts;
 
 use std::fs::File;
@@ -352,12 +353,7 @@ fn map_file(path: &Path) -> Option<Mmap> {
     if std::env::var_os("POPULATE").is_some() {
         o.populate();
     }
-    let m = unsafe { o.map(&f).ok()? };
-    // Ask the kernel to start reading the whole file now: free when it is
-    // already cached, and a head start on every file at once when it is not.
-    #[cfg(unix)]
-    let _ = m.advise(memmap2::Advice::WillNeed);
-    Some(m)
+    unsafe { o.map(&f).ok() }
 }
 
 fn map_dir(dir: &Path) -> Vec<Mmap> {
